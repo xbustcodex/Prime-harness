@@ -30,11 +30,19 @@ class TerminalSlot:
 
 
 class TerminalManager:
-    """Six isolated CMD sessions. The manager must outlive the browser UI."""
+    """Independent CMD sessions, owned by the host rather than any UI."""
 
-    def __init__(self, count: int = 6, cwd: Path | None = None):
+    def __init__(self, count: int = 4, cwd: Path | None = None):
         self.cwd = str((cwd or Path.home()).resolve())
         self.slots = {i: TerminalSlot(i) for i in range(1, count + 1)}
+        self._slots_lock = threading.RLock()
+
+    def add_slot(self) -> int:
+        """Allocate another independent terminal; caller launches and pairs it."""
+        with self._slots_lock:
+            slot_id = max(self.slots, default=0) + 1
+            self.slots[slot_id] = TerminalSlot(slot_id)
+            return slot_id
 
     def slot(self, slot_id: int) -> TerminalSlot:
         if slot_id not in self.slots:
