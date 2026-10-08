@@ -533,12 +533,21 @@ class OmpAgentProvider:
             return AgentCommandResult(False, "", "Instruction is empty", "failed")
         try:
             outcome, events = process.prompt_and_wait(instruction)
-        except OmpRpcError:
-            return AgentCommandResult(False, "", "OMP instruction failed", "failed")
+        except OmpRpcError as exc:
+            return AgentCommandResult(
+                False,
+                "",
+                str(exc),
+                "failed",
+            )
         status = str(outcome.get("status"))
         assistant_text = self._assistant_text(events)
         changed_files = self._changed_files(events)
         permission_request = self._permission_request(events)
+
+        # Collect diagnostics from outcome and events
+        diagnostics = self._collect_instruction_diagnostics(outcome, events)
+
         if permission_request:
             return AgentCommandResult(
                 False,
@@ -546,7 +555,7 @@ class OmpAgentProvider:
                 "OMP operation requires human approval",
                 "approval_required",
                 changed_files=changed_files,
-                evidence=self._evidence(events, session, status),
+                evidence=self._evidence(events, session, status, diagnostics),
             )
         if status == "aborted":
             session.process_status = "stopped"
@@ -556,17 +565,18 @@ class OmpAgentProvider:
                 "OMP operation was cancelled",
                 "aborted",
                 changed_files=changed_files,
-                evidence=self._evidence(events, session, status),
+                evidence=self._evidence(events, session, status, diagnostics),
             )
         if status != "completed":
             session.process_status = "failed"
+            error_msg = diagnostics.get("outcome_failure_reason", "OMP operation failed")
             return AgentCommandResult(
                 False,
                 assistant_text,
-                "OMP operation failed",
+                error_msg,
                 "failed",
                 changed_files=changed_files,
-                evidence=self._evidence(events, session, status),
+                evidence=self._evidence(events, session, status, diagnostics),
             )
         session.process_status = "completed"
         session.updated_at = now_utc()
@@ -575,7 +585,7 @@ class OmpAgentProvider:
             assistant_text,
             status="completed",
             changed_files=changed_files,
-            evidence=self._evidence(events, session, status),
+            evidence=self._evidence(events, session, status, diagnostics),
         )
 
     def snapshot(self, session: AgentSession) -> AgentSession:
@@ -708,8 +718,72 @@ class OmpAgentProvider:
                 return True
         return False
 
+    @staticmethod
+    def _collect_instruction_diagnostics(
+        outcome: dict[str, Any], events: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Collect bounded, sanitized diagnostics from instruction outcome and events."""
+        diagnostics: dict[str, Any] = {}
+
+        # Report outcome status
+        status = outcome.get("status")
+        if isinstance(status, str):
+            diagnostics["outcome_status"] = status
+
+        # Report agent invocation state
+        agent_invoked = outcome.get("agentInvoked")
+        if isinstance(agent_invoked, bool):
+            diagnostics["agent_invoked"] = agent_invoked
+
+        # Report session settled state
+        session_settled = outcome.get("sessionSettled")
+        if isinstance(session_settled, bool):
+            diagnostics["session_settled"] = session_settled
+
+        # Collect tool availability and execution summary
+        tool_names: set[str] = set()
+        tool_errors: list[str] = []
+        for event in events:
+            event_type = event.get("type")
+            if event_type == "tool_execution_start":
+                tool_name = event.get("toolName")
+                if isinstance(tool_name, str):
+                    tool_names.add(tool_name[:50])
+            elif event_type == "tool_execution_end":
+                if event.get("isError") is True:
+                    tool_name = event.get("toolName")
+                    if isinstance(tool_name, str):
+                        tool_errors.append(f"{tool_name[:50]}: error")
+
+        if tool_names:
+            diagnostics["tools_invoked"] = sorted(tool_names)
+        if tool_errors:
+            diagnostics["tool_failures"] = tool_errors[:5]  # Limit to first 5
+
+        # Collect agent events for lifecycle awareness
+        agent_started = any(e.get("type") == "agent_start" for e in events)
+        agent_ended = any(e.get("type") == "agent_end" for e in events)
+        if agent_started or agent_ended:
+            diagnostics["agent_lifecycle"] = {
+                "started": agent_started,
+                "ended": agent_ended,
+            }
+
+        # Report any error outcome detail
+        error_detail = outcome.get("error")
+        if isinstance(error_detail, str) and error_detail.strip():
+            # Sanitize: limit length and no sensitive data
+            bounded = error_detail[:200]
+            diagnostics["outcome_failure_reason"] = bounded
+
+        return diagnostics
+
     def _evidence(
-        self, events: list[dict[str, Any]], session: AgentSession, status: str
+        self,
+        events: list[dict[str, Any]],
+        session: AgentSession,
+        status: str,
+        diagnostics: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         summaries = [
             {
@@ -727,12 +801,15 @@ class OmpAgentProvider:
                 "extension_ui_request",
             }
         ]
-        return {
+        evidence: dict[str, Any] = {
             "provider": "omp",
             "provider_session_id": session.provider_session_id,
             "execution_status": status,
             "activity": summaries,
         }
+        if diagnostics:
+            evidence["diagnostics"] = diagnostics
+        return evidence
 
     @staticmethod
     def _tool_name(event: dict[str, Any]) -> str | None:
