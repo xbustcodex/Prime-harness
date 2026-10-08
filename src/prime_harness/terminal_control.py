@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -116,3 +117,64 @@ class TerminalManager:
         if slot.alive:
             with slot.lock:
                 slot.process.setwinsize(rows, cols)  # type: ignore[union-attr]
+
+    def shutdown(self, slot_ids: list[int] | None = None) -> dict[int, bool]:
+        """Reliable process-tree shutdown for ConPTY sessions.
+
+        Terminates only slots owned by this manager. Uses bounded
+        waits and verifies termination rather than arbitrary sleep.
+        Clears subscribers and nulls process references so that
+        temporary directories (cwd) can be removed.
+        """
+        results: dict[int, bool] = {}
+        targets = slot_ids if slot_ids is not None else list(self.slots)
+        for sid in targets:
+            if sid not in self.slots:
+                results[sid] = False
+                continue
+            slot = self.slots[sid]
+            terminated = False
+            with slot.lock:
+                # Clear subscriber queues to drop references to external objects
+                slot.subscribers.clear()
+                if slot.process is not None:
+                    try:
+                        if bool(slot.process.isalive()):  # type: ignore[union-attr]
+                            # Prefer graceful terminate; fall back to kill
+                            try:
+                                slot.process.terminate()  # type: ignore[union-attr]
+                            except Exception:
+                                pass
+                            # Bounded wait (max ~2s) with verification
+                            start = time.time()
+                            while time.time() - start < 2.0:
+                                if not bool(slot.process.isalive()):  # type: ignore[union-attr]
+                                    terminated = True
+                                    break
+                                time.sleep(0.05)
+                            if not terminated:
+                                try:
+                                    slot.process.kill()  # type: ignore[union-attr]
+                                except Exception:
+                                    pass
+                                # Second bounded wait
+                                start2 = time.time()
+                                while time.time() - start2 < 1.0:
+                                    if not bool(slot.process.isalive()):  # type: ignore[union-attr]
+                                        terminated = True
+                                        break
+                                    time.sleep(0.05)
+                            else:
+                                terminated = True
+                        else:
+                            terminated = True
+                    except Exception:
+                        pass
+                    # Null reference to allow GC and handle release
+                    slot.process = None
+                    slot.recent.clear()
+                else:
+                    # Already cleaned / never started; treat as terminated for cleanup
+                    terminated = True
+            results[sid] = terminated
+        return results
