@@ -34,6 +34,19 @@ jobs:
           cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE /c /Fo:dist/phase1_poc_terminal.obj src/prime_harness/phase1_poc/phase1_poc_terminal.cpp
           if ($LASTEXITCODE -ne 0) { throw "MSVC compilation failed: $LASTEXITCODE" }
           if (!(Test-Path dist/phase1_poc_terminal.obj)) { throw "Object file not produced" }
+      - name: Build runnable ConPTY console smoke test
+        shell: pwsh
+        run: |
+          cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE /Fe:dist/prime-harness-terminal-poc.exe src/prime_harness/phase1_poc/conpty_console_smoke.cpp
+          if ($LASTEXITCODE -ne 0) { throw "ConPTY executable compilation failed: $LASTEXITCODE" }
+          if (!(Test-Path dist/prime-harness-terminal-poc.exe)) { throw "Executable not produced" }
+      - name: Upload runnable smoke-test executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-harness-conpty-smoke-windows-x64
+          path: dist/prime-harness-terminal-poc.exe
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload compiled POC object
         uses: actions/upload-artifact@v4
         with:
