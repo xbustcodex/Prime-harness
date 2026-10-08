@@ -19,7 +19,7 @@ except ImportError:  # Linux imports remain usable for tests
 class TerminalSlot:
     slot_id: int
     process: object | None = None
-    token_hash: str = ""
+    token_hash: str = field(default="", repr=False)
     recent: deque[str] = field(default_factory=lambda: deque(maxlen=300))
     subscribers: list[object] = field(default_factory=list)
     lock: threading.RLock = field(default_factory=threading.RLock)
