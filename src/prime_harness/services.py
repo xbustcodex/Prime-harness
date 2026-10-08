@@ -29,6 +29,7 @@ from prime_harness.domain import (
     new_id,
     now_utc,
 )
+from prime_harness.omp import OmpAgentProvider
 from prime_harness.reviewers import DeterministicReviewerProvider, ReviewerProvider
 from prime_harness.secret_service import EnvironmentSecretKeyProvider, SecretService
 from prime_harness.stores import InMemoryStore, Store
@@ -36,13 +37,22 @@ from prime_harness.stores import InMemoryStore, Store
 
 class HarnessService:
     def __init__(
-        self, store: Store | None = None, workspace_root: Path | Path = Path.cwd(), now=None
+        self,
+        store: Store | None = None,
+        workspace_root: Path | Path = Path.cwd(),
+        now=None,
+        default_agent_provider: str = "shell",
+        omp_executable: str = "omp",
     ) -> None:
         self.store = store or InMemoryStore()
         self.workspace_root = Path(workspace_root).resolve()
         self._now = now or now_utc
         self._agent_providers: dict[str, CodingAgentProvider] = {}
         self._reviewer_providers: dict[str, ReviewerProvider] = {}
+        if default_agent_provider not in {"shell", "omp"}:
+            raise ValueError("Unsupported default coding-agent provider")
+        self.default_agent_provider = default_agent_provider
+        self.omp_executable = omp_executable
         self._lane_lock_guard = Lock()
         self._lane_locks: dict[str, RLock] = {}
         self.secret_service = SecretService(
@@ -128,6 +138,7 @@ class HarnessService:
             workspace_path=resolved,
             agent_id=f"agent-{name.lower().replace(' ', '-')}-1",
             reviewer_id=f"reviewer-{name.lower().replace(' ', '-')}-1",
+            provider=self.default_agent_provider,
         )
         self.store.create_lane(lane)
         self._event(
@@ -737,16 +748,26 @@ class HarnessService:
         session = self.store.get_session(session_id)
         if session is None or session.lane_id != lane_id:
             raise KeyError("Unknown session")
-        if not self.acquire_writer_lease(session_id, connection_id):
+        provider = self._agent_provider(session.agent_id)
+        if not self.acquire_writer_lease(
+            session_id, connection_id, self._provider_lease_ttl(provider)
+        ):
             raise PermissionError("Session is owned by another writer")
         session = self.store.get_session(session_id)
         if session is None:
             raise RuntimeError("Session disappeared after lease acquisition")
         lease_id = session.writer_lease_id
         try:
-            provider = self._agent_provider(session.agent_id)
             result = provider.send_instruction(session, instruction)
-            session.state = LaneState.WORKING if result.success else LaneState.FAILED
+            session.state = (
+                LaneState.WORKING
+                if result.success
+                else LaneState.HUMAN_REQUIRED
+                if result.status == "approval_required"
+                else LaneState.IDLE
+                if result.status == "aborted"
+                else LaneState.FAILED
+            )
             if result.success:
                 session.current_objective = instruction
             session.updated_at = self._now()
@@ -758,21 +779,36 @@ class HarnessService:
                     self.store.create_lane(lane)
                 self._transition(lane_id, LaneState.WORKING, connection_id, session_id)
             else:
+                target_state = (
+                    LaneState.HUMAN_REQUIRED
+                    if result.status == "approval_required"
+                    else LaneState.PAUSED
+                    if result.status == "aborted"
+                    else LaneState.FAILED
+                )
                 self._transition(
                     lane_id,
-                    LaneState.FAILED,
+                    target_state,
                     connection_id,
                     session_id,
-                    self._safe_diagnostic(result.error),
+                    "OMP operation requires human approval"
+                    if result.status == "approval_required"
+                    else "OMP operation cancelled"
+                    if result.status == "aborted"
+                    else self._safe_diagnostic(result.error),
                 )
             self._event(
                 lane_id,
                 "agent_instruction_sent",
-                "info" if result.success else "error",
+                "info"
+                if result.success
+                else "warning"
+                if result.status == "approval_required"
+                else "error",
                 {
                     "session_id": session_id,
                     "exit_code": result.exit_code,
-                    "status": "succeeded" if result.success else "failed",
+                    "status": "succeeded" if result.success else result.status,
                     "diagnostic": self._safe_diagnostic(result.error)
                     if not result.success
                     else None,
@@ -789,6 +825,7 @@ class HarnessService:
                     build_results="not-run",
                     evidence={
                         "action_status": "succeeded",
+                        **result.evidence,
                         "evidence_refs": [
                             f"agent-session:{session_id}",
                             f"provider-session:{session.provider_session_id or session.session_id}",
@@ -814,16 +851,26 @@ class HarnessService:
         session = self.store.get_session(session_id)
         if session is None or session.lane_id != lane_id:
             raise KeyError("Unknown session")
-        if not self.acquire_writer_lease(session_id, connection_id):
+        provider = self._agent_provider(session.agent_id)
+        if not self.acquire_writer_lease(
+            session_id, connection_id, self._provider_lease_ttl(provider)
+        ):
             raise PermissionError("Session is owned by another writer")
         session = self.store.get_session(session_id)
         if session is None:
             raise RuntimeError("Session disappeared after lease acquisition")
         lease_id = session.writer_lease_id
         try:
-            provider = self._agent_provider(session.agent_id)
             result = provider.send_instruction(session, instruction)
-            session.state = LaneState.WORKING if result.success else LaneState.FAILED
+            session.state = (
+                LaneState.WORKING
+                if result.success
+                else LaneState.HUMAN_REQUIRED
+                if result.status == "approval_required"
+                else LaneState.IDLE
+                if result.status == "aborted"
+                else LaneState.FAILED
+            )
             session.updated_at = self._now()
             self.store.create_session(session)
             lane = self.store.get_lane(lane_id)
@@ -838,18 +885,34 @@ class HarnessService:
                     )
                 self._transition(
                     lane_id,
-                    LaneState.WORKING if result.success else LaneState.FAILED,
+                    LaneState.WORKING
+                    if result.success
+                    else LaneState.HUMAN_REQUIRED
+                    if result.status == "approval_required"
+                    else LaneState.PAUSED
+                    if result.status == "aborted"
+                    else LaneState.FAILED,
                     connection_id,
                     session_id,
-                    None if result.success else self._safe_diagnostic(result.error),
+                    None
+                    if result.success
+                    else "OMP operation requires human approval"
+                    if result.status == "approval_required"
+                    else "OMP operation cancelled"
+                    if result.status == "aborted"
+                    else self._safe_diagnostic(result.error),
                 )
             self._event(
                 lane_id,
                 "agent_continued",
-                "info" if result.success else "error",
+                "info"
+                if result.success
+                else "warning"
+                if result.status == "approval_required"
+                else "error",
                 {
                     "session_id": session_id,
-                    "status": "succeeded" if result.success else "failed",
+                    "status": "succeeded" if result.success else result.status,
                     "exit_code": result.exit_code,
                     "diagnostic": self._safe_diagnostic(result.error)
                     if not result.success
@@ -867,6 +930,7 @@ class HarnessService:
                     build_results="not-run",
                     evidence={
                         "action_status": "succeeded",
+                        **result.evidence,
                         "evidence_refs": [
                             f"agent-session:{session_id}",
                             f"provider-session:{session.provider_session_id or session.session_id}",
@@ -904,10 +968,19 @@ class HarnessService:
         session = self.store.get_session(session_id)
         if session is None or session.lane_id != lane_id:
             raise KeyError("Unknown session")
-        if not self.acquire_writer_lease(session_id, connection_id):
-            raise PermissionError("Session is owned by another writer")
+        existing_lease_owned = (
+            session.writer_id == connection_id
+            and session.writer_lease_expires_at is not None
+            and session.writer_lease_expires_at > self._now()
+        )
+        acquired_lease = False
+        if not existing_lease_owned:
+            if not self.acquire_writer_lease(session_id, connection_id):
+                raise PermissionError("Session is owned by another writer")
+            acquired_lease = True
         session = self.store.get_session(session_id)
         lease_id = session.writer_lease_id if session else None
+        stopped = False
         try:
             if session is None:
                 raise RuntimeError("Session disappeared after lease acquisition")
@@ -925,7 +998,10 @@ class HarnessService:
                 return False
             session.state = LaneState.IDLE
             self.store.create_session(session)
-            self._transition(lane_id, LaneState.IDLE, connection_id, session_id, "Agent stopped")
+            self._transition(
+                lane_id, LaneState.IDLE, connection_id, session_id, "Agent stopped"
+            )
+            stopped = True
             self._event(
                 lane_id,
                 "agent_stopped",
@@ -936,7 +1012,7 @@ class HarnessService:
             )
             return True
         finally:
-            if lease_id:
+            if lease_id and (acquired_lease or stopped):
                 self.release_writer_lease(session_id, lease_id)
 
     def _agent_provider(self, agent_id: str) -> CodingAgentProvider:
@@ -1069,16 +1145,37 @@ class HarnessService:
             return False
 
     def create_agent_provider(
-        self, lane_id: str, workspace_path: Path, command: str = "bash"
-    ) -> ShellAgentProvider:
+        self,
+        lane_id: str,
+        workspace_path: Path,
+        command: str = "bash",
+        provider_name: str | None = None,
+    ) -> CodingAgentProvider:
         lane = self.store.get_lane(lane_id)
         if lane is None:
             raise KeyError("Unknown lane")
         policy = WorkspacePolicy(self.workspace_root)
         resolved = policy.resolve(workspace_path)
-        provider = ShellAgentProvider(AgentConfig(lane.agent_id, "shell", command, resolved, 120))
+        selected_provider = provider_name or lane.provider
+        if selected_provider == "shell":
+            provider: CodingAgentProvider = ShellAgentProvider(
+                AgentConfig(lane.agent_id, "shell", command, resolved, 120)
+            )
+        elif selected_provider == "omp":
+            provider = OmpAgentProvider(
+                agent_id=lane.agent_id,
+                workspace_path=resolved,
+                executable=self.omp_executable,
+            )
+        else:
+            raise ValueError("Unsupported coding-agent provider")
         self.register_agent_provider(lane_id, provider)
         return provider
+
+    @staticmethod
+    def _provider_lease_ttl(provider: CodingAgentProvider) -> int:
+        timeout = getattr(provider, "timeout_seconds", 300)
+        return max(300, int(timeout) + 30)
 
     def create_temporary_lane(self, name: str, project_id: str) -> Lane:
         return self.create_lane(name, project_id, self.workspace_root / project_id)

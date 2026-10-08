@@ -40,3 +40,22 @@ pytest -q
 ruff check .
 mypy src/prime_harness
 ```
+
+## OMP runtime verification
+
+Use the real OMP RPC smoke test when a local OMP binary is available. The script
+creates a temporary lane, starts an OMP session, confirms instruction delivery,
+exercises reviewer correction/continuation, and validates session restoration.
+
+```sh
+python scripts/verify_omp_runtime.py /path/to/omp
+```
+
+On Windows, pass the full executable path or the `.exe` launcher, for example:
+
+```powershell
+python .\scripts\verify_omp_runtime.py C:\tools\omp.exe
+```
+
+The command exits with `REAL_OMP_VERIFICATION=PASS` only when a real OMP runtime
+fulfills the end-to-end session lifecycle and restore checks.

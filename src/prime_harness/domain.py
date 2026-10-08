@@ -28,12 +28,14 @@ class LaneState(StrEnum):
                 LaneState.PAUSED,
                 LaneState.FAILED,
                 LaneState.COMPLETED,
+                LaneState.HUMAN_REQUIRED,
             },
             LaneState.WORKING: {
                 LaneState.CHECKPOINT,
                 LaneState.PAUSED,
                 LaneState.FAILED,
                 LaneState.COMPLETED,
+                LaneState.HUMAN_REQUIRED,
             },
             LaneState.CHECKPOINT: {
                 LaneState.WAITING_FOR_REVIEW,
@@ -346,3 +348,4 @@ class AgentCommandResult:
     status: str = "completed"
     exit_code: int | None = None
     changed_files: list[str] = field(default_factory=list)
+    evidence: dict[str, Any] = field(default_factory=dict)

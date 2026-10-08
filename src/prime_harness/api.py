@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from dataclasses import fields, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from prime_harness.domain import AgentSession
+from prime_harness.omp import OmpAgentProvider, OmpRpcError
 from prime_harness.services import HarnessService
 
 
@@ -41,9 +45,19 @@ def create_app(service: HarnessService) -> FastAPI:
         try:
             service._agent_provider(session.agent_id)
         except KeyError:
-            provider = service.create_agent_provider(session.lane_id, session.workspace_path)
+            service.create_agent_provider(
+                session.lane_id,
+                session.workspace_path,
+                provider_name=session.provider,
+            )
             if session.provider_session_id:
-                provider.restore_session(session)
+                try:
+                    service.restore_agent_session(session.lane_id, session.session_id)
+                except (OmpRpcError, RuntimeError, ValueError):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Agent session cannot be restored",
+                    ) from None
             else:
                 raise HTTPException(
                     status_code=409,
@@ -69,7 +83,12 @@ def create_app(service: HarnessService) -> FastAPI:
         if lane is None:
             raise HTTPException(status_code=404, detail="Unknown lane")
         service.create_agent_provider(lane_id, lane.workspace_path)
-        session = service.start_agent_session(lane_id)
+        try:
+            session = service.start_agent_session(lane_id)
+        except OmpRpcError:
+            raise HTTPException(
+                status_code=503, detail="Coding-agent provider unavailable"
+            ) from None
         service._event(
             lane_id,
             "agent_session_started",
@@ -100,6 +119,46 @@ def create_app(service: HarnessService) -> FastAPI:
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail="Control operation denied") from exc
+
+    @app.get("/api/lanes/{lane_id}/agents/{session_id}/activity")
+    async def agent_activity(
+        lane_id: str,
+        session_id: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> StreamingResponse:
+        connection_id = authenticate(lane_id, authorization, "read")
+        try:
+            session = service.read_session_authenticated(connection_id, lane_id, session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Unknown session") from exc
+        ensure_provider(session)
+        provider = service._agent_provider(session.agent_id)
+        if not isinstance(provider, OmpAgentProvider):
+            raise HTTPException(status_code=409, detail="Session does not use OMP")
+        loop = asyncio.get_running_loop()
+        events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        def receive_activity(event: dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(events.put_nowait, event)
+
+        unsubscribe = provider.subscribe_activity(session_id, receive_activity)
+
+        async def stream():
+            try:
+                for event in provider.recent_activity(session_id):
+                    yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+                while not await request.is_disconnected():
+                    try:
+                        event = await asyncio.wait_for(events.get(), timeout=15)
+                    except TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+            finally:
+                unsubscribe()
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
 
     @app.post("/api/lanes/{lane_id}/agents/{session_id}/continue")
     def continue_agent(

@@ -25,12 +25,14 @@ def test_lane_state_machine_enforces_allowed_transitions():
             LaneState.PAUSED,
             LaneState.FAILED,
             LaneState.COMPLETED,
+            LaneState.HUMAN_REQUIRED,
         },
         LaneState.WORKING: {
             LaneState.CHECKPOINT,
             LaneState.PAUSED,
             LaneState.FAILED,
             LaneState.COMPLETED,
+            LaneState.HUMAN_REQUIRED,
         },
         LaneState.CHECKPOINT: {
             LaneState.WAITING_FOR_REVIEW,
@@ -165,10 +167,12 @@ def test_checkpoint_and_review_records_are_immutable(tmp_path: Path):
         model="deterministic",
     )
 
+    objective_field = "objective"
+    status_field = "status"
     with pytest.raises(AttributeError):
-        checkpoint.objective = "mutated"
+        setattr(checkpoint, objective_field, "mutated")
     with pytest.raises(AttributeError):
-        review.status = "rejected"
+        setattr(review, status_field, "rejected")
     with pytest.raises(TypeError):
         checkpoint.evidence["new"] = "not allowed"
     store = InMemoryStore()

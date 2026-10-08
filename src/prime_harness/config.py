@@ -31,3 +31,5 @@ class HarnessSettings:
     api_key: str | None = None
     host: str = "127.0.0.1"
     port: int = 8000
+    agent_provider: str = "shell"
+    omp_executable: str = "omp"

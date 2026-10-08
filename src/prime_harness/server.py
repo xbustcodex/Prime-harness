@@ -15,7 +15,12 @@ def main() -> None:
     workspace = Path(os.environ.get("PRIME_HARNESS_WORKSPACE", Path.cwd())).resolve()
     host = os.environ.get("PRIME_HARNESS_HOST", "127.0.0.1")
     port = int(os.environ.get("PRIME_HARNESS_PORT", "8000"))
-    service = HarnessService(SqliteStore(database), workspace)
+    service = HarnessService(
+        SqliteStore(database),
+        workspace,
+        default_agent_provider=os.environ.get("PRIME_HARNESS_AGENT_PROVIDER", "shell"),
+        omp_executable=os.environ.get("PRIME_HARNESS_OMP_EXECUTABLE", "omp"),
+    )
     uvicorn.run(
         create_app(service),
         host=host,

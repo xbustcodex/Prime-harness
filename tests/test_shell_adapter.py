@@ -49,5 +49,6 @@ def test_shell_agent_rejects_workspace_escape(tmp_path: Path):
     result = provider.send_instruction(session, "Read /etc/passwd")
 
     assert result.success is False
+    assert result.error is not None
     assert "workspace" in result.error.lower()
     assert provider.stop_session(session) is True

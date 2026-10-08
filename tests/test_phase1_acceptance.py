@@ -83,20 +83,24 @@ def test_authorized_service_and_api_deny_cross_lane_data_both_directions(tmp_pat
     service.review_checkpoint_authenticated(
         connection_b, lane_b, thread_b.thread_id, checkpoint_b.checkpoint_id
     )
+    lane_b_record = service.store.get_lane(lane_b)
+    assert lane_b_record is not None
     with pytest.raises(KeyError):
         service.submit_review(
             lane_a,
             thread_b.thread_id,
             checkpoint_a.checkpoint_id,
-            service.store.get_lane(lane_b).reviewer_id,
+            lane_b_record.reviewer_id,
             service._reviewer_provider_for_lane(lane_b),
         )
+    lane_a_record = service.store.get_lane(lane_a)
+    assert lane_a_record is not None
     with pytest.raises(KeyError):
         service.submit_review(
             lane_b,
             thread_a.thread_id,
             checkpoint_b.checkpoint_id,
-            service.store.get_lane(lane_a).reviewer_id,
+            lane_a_record.reviewer_id,
             service._reviewer_provider_for_lane(lane_a),
         )
 
@@ -192,7 +196,9 @@ def test_sqlite_lease_race_has_one_winner_and_expiry_is_reacquired_auditably(tmp
     expired_before_reacquisition = SqliteStore(database).get_session(session.session_id)
     assert expired_before_reacquisition is not None
     assert expired_before_reacquisition.writer_id == first_writer
-    assert expired_before_reacquisition.writer_lease_expires_at < instant[0]
+    expires_at = expired_before_reacquisition.writer_lease_expires_at
+    assert expires_at is not None
+    assert expires_at < instant[0]
     reclaimer = HarnessService(SqliteStore(database), workspace_root, lambda: instant[0])
     reclaimer.release_writer_lease(session.session_id, first_lease or "")
     assert reclaimer.acquire_writer_lease(session.session_id, "controller-3", 10)
@@ -243,7 +249,9 @@ def test_parallel_lane_checkpoints_have_independent_reviewers_and_stable_local_o
         assert checkpoint.evidence["lane_marker"] == index
         assert review.lane_id == lane_id
         assert review.reviewer_thread_id == thread.thread_id
-        assert service.store.get_thread(thread.thread_id).lane_id == lane_id
+        stored_thread = service.store.get_thread(thread.thread_id)
+        assert stored_thread is not None
+        assert stored_thread.lane_id == lane_id
 
     concurrent_appends = [
         (lane_id, lane_index, append_index)
@@ -309,19 +317,16 @@ def test_reviewer_rollover_creates_successor_and_preserves_durable_evidence(tmp_
     persisted_checkpoint = restarted.get_checkpoint(lane_id, checkpoint.checkpoint_id)
     assert persisted_checkpoint is not None
     assert persisted_checkpoint.evidence["evidence_refs"] == ("diff:marker", "test:passed")
-    assert (
-        restarted.get_transcript(lane_id, checkpoint.checkpoint_id)["transcript"]
-        == "agent created marker"
-    )
+    transcript = restarted.get_transcript(lane_id, checkpoint.checkpoint_id)
+    assert transcript is not None
+    assert transcript["transcript"] == "agent created marker"
     assert restarted.store.get_thread(original_thread.thread_id) is not None
-    assert (
-        restarted.store.get_thread(successor.thread_id).parent_thread_id
-        == original_thread.thread_id
-    )
-    assert (
-        restarted.rollover_review_thread(lane_id, checkpoint.checkpoint_id).thread_id
-        == successor.thread_id
-    )
+    restored_successor = restarted.store.get_thread(successor.thread_id)
+    assert restored_successor is not None
+    assert restored_successor.parent_thread_id == original_thread.thread_id
+    idempotent_successor = restarted.rollover_review_thread(lane_id, checkpoint.checkpoint_id)
+    assert idempotent_successor is not None
+    assert idempotent_successor.thread_id == successor.thread_id
 
 
 def test_history_compaction_preserves_checkpoint_decisions_and_evidence_refs(tmp_path: Path):
@@ -421,6 +426,7 @@ def test_approval_is_pending_then_exactly_once_across_races_and_restart(tmp_path
     )
     failed_record = restarted.store.get_approval_request(failed_request["request_id"])
     assert failed_record is not None and failed_record.status == "failed"
+    assert failed_record.result is not None
     assert failed_record.result["status"] == "failed"
     assert len(failed_record.result["diagnostic"]) <= 500
     assert existing_file.read_text(encoding="utf-8") == "original"
@@ -437,9 +443,11 @@ def test_failed_external_action_is_persisted_failed_without_secrets(tmp_path: Pa
     service, database, workspace_root = make_service(tmp_path)
     lane_id, connection_id = make_lane(service, "A1", "project-a")
     credential_marker = "credential-sentinel-not-for-storage"
+    lane = service.store.get_lane(lane_id)
+    assert lane is not None
     provider = ShellAgentProvider(
         AgentConfig(
-            agent_id=service.store.get_lane(lane_id).agent_id,
+            agent_id=lane.agent_id,
             provider="shell",
             command="bash",
             workspace_path=workspace_root / "project-a",
@@ -807,8 +815,8 @@ def _start_web(database: Path, workspace: Path) -> tuple[subprocess.Popen, int]:
     return process, port
 
 
-def _stop_web(process: subprocess.Popen) -> None:
-    if process.poll() is None:
+def _stop_web(process: subprocess.Popen | None) -> None:
+    if process is not None and process.poll() is None:
         process.terminate()
         try:
             process.communicate(timeout=5)
@@ -819,6 +827,7 @@ def _stop_web(process: subprocess.Popen) -> None:
 
 def test_http_vertical_workflow_restart_recovery_and_revocation(tmp_path: Path):
     service, database, workspace_root = make_service(tmp_path)
+    process: subprocess.Popen | None
     process, port = _start_web(database, workspace_root)
     try:
         lane_id, connection_record_id = make_lane(service, "A1", "project-a")
@@ -1000,7 +1009,9 @@ def test_http_vertical_workflow_restart_recovery_and_revocation(tmp_path: Path):
         assert reviews[0]["reviewer_thread_id"] == thread["thread_id"]
         assert reviews[1]["reviewer_thread_id"] == successor.thread_id
         assert service.get_checkpoint(lane_id, checkpoint1["checkpoint_id"]) is not None
-        assert service.store.get_thread(successor.thread_id).parent_thread_id == thread["thread_id"]
+        restored_thread = service.store.get_thread(successor.thread_id)
+        assert restored_thread is not None
+        assert restored_thread.parent_thread_id == thread["thread_id"]
 
         # A restored provider/session identity remains usable after the web process restart.
         status, after_restart = _http(

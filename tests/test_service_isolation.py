@@ -35,10 +35,12 @@ def test_two_writers_cannot_own_one_session(tmp_path: Path):
 
     first = service.acquire_writer_lease(session.session_id, "connection-1")
     second = service.acquire_writer_lease(session.session_id, "connection-2")
+    owned = service.get_session(session.session_id)
 
     assert first is True
     assert second is False
-    assert service.get_session(session.session_id).writer_id == "connection-1"
+    assert owned is not None
+    assert owned.writer_id == "connection-1"
 
 
 def test_reviewer_rollover_preserves_history(tmp_path: Path):
@@ -69,4 +71,6 @@ def test_revoked_connection_cannot_control_agent(tmp_path: Path):
     assert service.revoke_connection(connection_id) is True
 
     assert service.can_execute(connection_id, "send_instruction", lane.lane_id) is False
-    assert service.get_session(session.session_id).writer_id is None
+    revoked_session = service.get_session(session.session_id)
+    assert revoked_session is not None
+    assert revoked_session.writer_id is None
