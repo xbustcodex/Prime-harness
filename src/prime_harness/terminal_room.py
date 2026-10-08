@@ -9,6 +9,11 @@ from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconne
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+
+class Resize(BaseModel):
+    rows: int = Field(ge=5, le=200)
+    cols: int = Field(ge=20, le=300)
+
 from prime_harness.terminal_control import TerminalManager
 
 manager = TerminalManager()
@@ -45,6 +50,12 @@ def create_terminal_app() -> FastAPI:
             raise HTTPException(409, str(exc)) from None
         return {"accepted": True}
 
+    @app.post("/api/terminals/{slot_id}/resize")
+    def resize_terminal(slot_id: int, body: Resize, authorization: str | None = Header(None)) -> dict:
+        auth(slot_id, authorization)
+        manager.resize(slot_id, body.rows, body.cols)
+        return {"rows": body.rows, "cols": body.cols}
+
     @app.get("/api/terminals/{slot_id}/output")
     def output_terminal(slot_id: int, authorization: str | None = Header(None)) -> dict:
         auth(slot_id, authorization)
@@ -63,6 +74,8 @@ def create_terminal_app() -> FastAPI:
                 await websocket.close(code=1008)
                 return
             slot = manager.slot(slot_id)
+            if isinstance(first.get("rows"), int) and isinstance(first.get("cols"), int):
+                manager.resize(slot_id, first["rows"], first["cols"])
             updates: queue.Queue[str] = queue.Queue(maxsize=512)
             with slot.lock:
                 slot.subscribers.append(updates)
@@ -75,7 +88,16 @@ def create_terminal_app() -> FastAPI:
                         await websocket.send_text(updates.get_nowait())
                     try:
                         incoming = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
-                        manager.write(slot_id, incoming)
+                        if incoming.startswith("\\x00"):
+                            import json
+                            try:
+                                command = json.loads(incoming[1:])
+                                if command.get("type") == "resize":
+                                    manager.resize(slot_id, int(command["rows"]), int(command["cols"]))
+                            except (ValueError, TypeError, KeyError, AttributeError):
+                                pass
+                        else:
+                            manager.write(slot_id, incoming)
                     except asyncio.TimeoutError:
                         pass
             finally:

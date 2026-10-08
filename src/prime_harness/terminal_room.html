@@ -2,8 +2,8 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Prime Harness</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <style>
-*{box-sizing:border-box}body{margin:0;background:#101318;color:#e7e9f0;font:14px system-ui}header{height:52px;padding:15px 22px;border-bottom:1px solid #333a46;font-weight:700;letter-spacing:.1em}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:16px;height:calc(100vh - 52px);grid-template-rows:repeat(2,minmax(200px,1fr))}.panel{min-height:0;background:#090c10;border:1px solid #39414d;border-radius:9px;display:flex;flex-direction:column;overflow:hidden}.heading{height:38px;display:flex;align-items:center;justify-content:space-between;padding:0 12px;border-bottom:1px solid #303640}.screen{flex:1;min-height:0;padding:8px}.controls{display:flex;gap:7px}button{background:#262d39;color:#fff;border:1px solid #455065;border-radius:5px;padding:4px 8px;cursor:pointer}.chat{padding:14px;color:#aaa}.chat textarea{width:100%;background:#151a22;color:#fff;border:1px solid #4a5260;resize:vertical}.chat button{margin-top:8px}.status{font-size:11px;color:#8b93a3}@media(max-width:900px){.grid{grid-template-columns:1fr;height:auto;grid-template-rows:none}.panel{height:290px}}
-</style></head><body><header>PRIME HARNESS</header><main class="grid" id="grid"></main>
+*{box-sizing:border-box}body{margin:0;background:#101318;color:#e7e9f0;font:14px system-ui}header{height:52px;padding:15px 22px;border-bottom:1px solid #333a46;font-weight:700;letter-spacing:.1em}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:16px;height:calc(100vh - 52px);grid-template-rows:repeat(2,minmax(200px,1fr))}.panel{min-height:0;background:#090c10;border:1px solid #39414d;border-radius:9px;display:flex;flex-direction:column;overflow:hidden}.heading{height:38px;display:flex;align-items:center;justify-content:space-between;padding:0 12px;border-bottom:1px solid #303640}.screen{flex:1;min-height:0;min-width:0;padding:8px;overflow:hidden}.panel:fullscreen{width:100vw;height:100vh}.controls{display:flex;gap:7px}button{background:#262d39;color:#fff;border:1px solid #455065;border-radius:5px;padding:4px 8px;cursor:pointer}.chat{padding:14px;color:#aaa}.chat textarea{width:100%;background:#151a22;color:#fff;border:1px solid #4a5260;resize:vertical}.chat button{margin-top:8px}.status{font-size:11px;color:#8b93a3}@media(max-width:900px){.grid{grid-template-columns:1fr;height:auto;grid-template-rows:none}.panel{height:290px}}
+</style><script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script></head><body><header>PRIME HARNESS</header><main class="grid" id="grid"></main>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script>
 const grid=document.getElementById('grid');
@@ -13,18 +13,22 @@ for(let i=1;i<=6;i++){
  if(i===5){const chat=document.createElement('section');chat.className='panel chat';chat.innerHTML='<strong>Central Chat</strong><p>Supervisor connection will be added in a later phase. This panel does not execute commands.</p>';grid.appendChild(chat)}
  grid.appendChild(panel);
  const term=new Terminal({cursorBlink:true,theme:{background:'#090c10',foreground:'#d4dce6'},fontSize:12});
- term.open(panel.querySelector('.screen'));term.writeln('Pair this terminal to begin.');
+ const fit=new FitAddon.FitAddon();term.loadAddon(fit);
+ term.open(panel.querySelector('.screen'));fit.fit();term.writeln('Pair this terminal to begin.');
+ const fitAndSync=()=>{if(!panel.isConnected)return;fit.fit();if(ws&&ws.readyState===WebSocket.OPEN)ws.send('\\x00'+JSON.stringify({type:'resize',rows:term.rows,cols:term.cols}))};
+ new ResizeObserver(fitAndSync).observe(panel.querySelector('.screen'));
+ panel.addEventListener('fullscreenchange',()=>requestAnimationFrame(fitAndSync));
  let ws=null;
  document.getElementById('pair'+i).onclick=()=>{
   const token=prompt('Enter CMD '+i+' pairing token (not saved)');
   if(!token)return;
   if(ws)ws.close();
   ws=new WebSocket('ws://'+location.host+'/ws/terminals/'+i);
-  ws.onopen=()=>ws.send(JSON.stringify({token}));
+  ws.onopen=()=>{fit.fit();ws.send(JSON.stringify({token,rows:term.rows,cols:term.cols}))};
   ws.onmessage=e=>{term.write(e.data);document.getElementById('state'+i).textContent='Connected'};
   ws.onclose=()=>{document.getElementById('state'+i).textContent='Disconnected'};
  };
  term.onData(data=>{if(ws&&ws.readyState===WebSocket.OPEN)ws.send(data)});
- document.getElementById('max'+i).onclick=()=>{panel.requestFullscreen?.()};
+ document.getElementById('max'+i).onclick=()=>{if(document.fullscreenElement===panel)document.exitFullscreen();else panel.requestFullscreen?.()};
 }
 </script></body></html>
