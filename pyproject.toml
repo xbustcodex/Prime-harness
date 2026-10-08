@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+windows = ["pywinpty>=2.0,<3.0"]
 dev = ["ruff>=0.5,<1.0", "mypy>=1.7,<2.0", "httpx2>=2.13,<3.0"]
 
 [tool.pytest.ini_options]
