@@ -545,10 +545,11 @@ class OmpAgentProvider:
         changed_files = self._changed_files(events)
         permission_request = self._permission_request(events)
 
-        # Collect diagnostics from outcome and events
-        diagnostics = self._collect_instruction_diagnostics(outcome, events)
+        # Collect structured diagnostics
+        diagnostics = self._build_instruction_diagnostics(outcome, events)
 
         if permission_request:
+            diagnostics["approval_blocked"] = True
             return AgentCommandResult(
                 False,
                 assistant_text,
@@ -557,6 +558,7 @@ class OmpAgentProvider:
                 changed_files=changed_files,
                 evidence=self._evidence(events, session, status, diagnostics),
             )
+
         if status == "aborted":
             session.process_status = "stopped"
             return AgentCommandResult(
@@ -567,9 +569,10 @@ class OmpAgentProvider:
                 changed_files=changed_files,
                 evidence=self._evidence(events, session, status, diagnostics),
             )
+
         if status != "completed":
             session.process_status = "failed"
-            error_msg = diagnostics.get("outcome_failure_reason", "OMP operation failed")
+            error_msg = self._format_failure_message(diagnostics)
             return AgentCommandResult(
                 False,
                 assistant_text,
@@ -578,6 +581,7 @@ class OmpAgentProvider:
                 changed_files=changed_files,
                 evidence=self._evidence(events, session, status, diagnostics),
             )
+
         session.process_status = "completed"
         session.updated_at = now_utc()
         return AgentCommandResult(
@@ -719,64 +723,82 @@ class OmpAgentProvider:
         return False
 
     @staticmethod
-    def _collect_instruction_diagnostics(
+    def _build_instruction_diagnostics(
         outcome: dict[str, Any], events: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Collect bounded, sanitized diagnostics from instruction outcome and events."""
+        """Build bounded, structured diagnostics from outcome and events.
+        
+        Captures categorical fields without exposing raw prompts, model output, or credentials.
+        """
         diagnostics: dict[str, Any] = {}
 
-        # Report outcome status
+        # Outcome status and invocation state
         status = outcome.get("status")
         if isinstance(status, str):
             diagnostics["outcome_status"] = status
 
-        # Report agent invocation state
         agent_invoked = outcome.get("agentInvoked")
         if isinstance(agent_invoked, bool):
             diagnostics["agent_invoked"] = agent_invoked
 
-        # Report session settled state
         session_settled = outcome.get("sessionSettled")
         if isinstance(session_settled, bool):
             diagnostics["session_settled"] = session_settled
 
-        # Collect tool availability and execution summary
-        tool_names: set[str] = set()
-        tool_errors: list[str] = []
+        # Tool invocation and error summary
+        tools_invoked: set[str] = set()
+        tool_failures: dict[str, str] = {}
+        
         for event in events:
             event_type = event.get("type")
+            
             if event_type == "tool_execution_start":
                 tool_name = event.get("toolName")
                 if isinstance(tool_name, str):
-                    tool_names.add(tool_name[:50])
+                    tools_invoked.add(tool_name[:50])
+            
             elif event_type == "tool_execution_end":
-                if event.get("isError") is True:
-                    tool_name = event.get("toolName")
-                    if isinstance(tool_name, str):
-                        tool_errors.append(f"{tool_name[:50]}: error")
+                tool_name = event.get("toolName")
+                if isinstance(tool_name, str):
+                    if event.get("isError") is True:
+                        # Only record if we see evidence of failure
+                        tool_failures[tool_name[:50]] = "error"
 
-        if tool_names:
-            diagnostics["tools_invoked"] = sorted(tool_names)
-        if tool_errors:
-            diagnostics["tool_failures"] = tool_errors[:5]  # Limit to first 5
+        if tools_invoked:
+            diagnostics["tools_invoked"] = sorted(tools_invoked)
+        
+        if tool_failures:
+            diagnostics["tool_failures"] = sorted(tool_failures.keys())
 
-        # Collect agent events for lifecycle awareness
+        # Agent lifecycle events
         agent_started = any(e.get("type") == "agent_start" for e in events)
         agent_ended = any(e.get("type") == "agent_end" for e in events)
+        
         if agent_started or agent_ended:
             diagnostics["agent_lifecycle"] = {
                 "started": agent_started,
                 "ended": agent_ended,
             }
 
-        # Report any error outcome detail
-        error_detail = outcome.get("error")
-        if isinstance(error_detail, str) and error_detail.strip():
-            # Sanitize: limit length and no sensitive data
-            bounded = error_detail[:200]
-            diagnostics["outcome_failure_reason"] = bounded
-
         return diagnostics
+
+    @staticmethod
+    def _format_failure_message(diagnostics: dict[str, Any]) -> str:
+        """Format a human-readable failure message from diagnostics."""
+        status = diagnostics.get("outcome_status", "unknown")
+        agent_invoked = diagnostics.get("agent_invoked")
+        tool_failures = diagnostics.get("tool_failures")
+
+        if status == "aborted":
+            return "OMP operation was aborted"
+        elif status == "error":
+            return "OMP operation encountered an error"
+        elif agent_invoked is False:
+            return "OMP agent was not invoked; operation could not proceed"
+        elif tool_failures:
+            return f"OMP operation failed: tools failed ({', '.join(tool_failures[:2])})"
+        else:
+            return "OMP operation did not complete"
 
     def _evidence(
         self,
