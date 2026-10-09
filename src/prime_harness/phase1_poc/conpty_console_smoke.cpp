@@ -11,6 +11,9 @@
 #include <thread>
 #include <cstdio>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <chrono>
 
 using ClosePseudoConsoleFn = void (WINAPI*)(HPCON);
 using CreatePseudoConsoleFn = HRESULT (WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
@@ -45,7 +48,11 @@ int wmain(int argc, wchar_t** argv) {
         fwprintf(stderr, L"Run this executable in an interactive Windows terminal.\n");
         return 2;
     }
-    SetConsoleMode(outConsole, oldOutputMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    const UINT oldInputCP = GetConsoleCP();
+    const UINT oldOutputCP = GetConsoleOutputCP();
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleMode(outConsole, oldOutputMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN);
     // VT input converts keyboard keys to VT sequences for the child ConPTY.
     SetConsoleMode(inConsole, (oldInputMode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS) &
                              ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE));
@@ -56,6 +63,7 @@ int wmain(int argc, wchar_t** argv) {
         fwprintf(stderr, L"%ls failed, Win32 error %lu\n", what, GetLastError());
         SetConsoleMode(inConsole, oldInputMode);
         SetConsoleMode(outConsole, oldOutputMode);
+        SetConsoleCP(oldInputCP); SetConsoleOutputCP(oldOutputCP);
         return 1;
     };
     if (!CreatePipe(&ptyInputRead, &ptyInputWrite, nullptr, 0)) return fail(L"Input pipe");
@@ -103,6 +111,49 @@ int wmain(int argc, wchar_t** argv) {
         return fail(L"CreateProcess");
     }
 
+    // Keep writes from typing and clipboard paste ordered.
+    std::mutex inputWriteMutex;
+    auto sendInput = [&](const char* data, DWORD length) {
+        std::lock_guard<std::mutex> lock(inputWriteMutex);
+        DWORD offset = 0;
+        while (offset < length) {
+            DWORD written = 0;
+            if (!WriteFile(ptyInputWrite, data + offset, length - offset, &written, nullptr) || !written) return false;
+            offset += written;
+        }
+        return true;
+    };
+    std::atomic<bool> running{true};
+    // Ctrl+Shift+V is handled here even when the console host doesn't paste.
+    // Clipboard access is scoped to the foreground console window.
+    std::thread paste([&] {
+        bool held = false;
+        while (running.load()) {
+            const bool pressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+                                 (GetAsyncKeyState(VK_SHIFT) & 0x8000) &&
+                                 (GetAsyncKeyState('V') & 0x8000);
+            const HWND foreground = GetForegroundWindow();
+            const bool focused = foreground && foreground == GetConsoleWindow();
+            if (pressed && !held && focused && OpenClipboard(nullptr)) {
+                HANDLE clip = GetClipboardData(CF_UNICODETEXT);
+                if (clip) {
+                    const wchar_t* wide = static_cast<const wchar_t*>(GlobalLock(clip));
+                    if (wide) {
+                        int bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+                        if (bytes > 1) {
+                            std::string utf8(static_cast<size_t>(bytes), '\0');
+                            WideCharToMultiByte(CP_UTF8, 0, wide, -1, &utf8[0], bytes, nullptr, nullptr);
+                            sendInput(utf8.data(), static_cast<DWORD>(bytes - 1));
+                        }
+                        GlobalUnlock(clip);
+                    }
+                }
+                CloseClipboard();
+            }
+            held = pressed;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+    });
     // Output thread exits when ConPTY closes its output pipe.
     std::thread output([&] {
         char buffer[8192];
@@ -118,16 +169,11 @@ int wmain(int argc, wchar_t** argv) {
     });
     // Input thread is detached: ReadFile on console can block after the child exits.
     // Process exit terminates it; do not close handles while it is still using them.
-    std::thread input([=] {
+    std::thread input([&] {
         char buffer[4096];
         DWORD n = 0;
         while (ReadFile(inConsole, buffer, sizeof(buffer), &n, nullptr) && n) {
-            DWORD offset = 0;
-            while (offset < n) {
-                DWORD written = 0;
-                if (!WriteFile(ptyInputWrite, buffer + offset, n - offset, &written, nullptr) || !written) return;
-                offset += written;
-            }
+            if (!sendInput(buffer, n)) return;
         }
     });
     input.detach();
@@ -137,11 +183,14 @@ int wmain(int argc, wchar_t** argv) {
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    running.store(false);
+    paste.join();
     close(pty);
     output.join();
     CloseHandle(ptyOutputRead);
     // Input thread may still be blocked on the console; handle is reclaimed at process exit.
     SetConsoleMode(inConsole, oldInputMode);
     SetConsoleMode(outConsole, oldOutputMode);
+    SetConsoleCP(oldInputCP); SetConsoleOutputCP(oldOutputCP);
     return static_cast<int>(exitCode);
 }
