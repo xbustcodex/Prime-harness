@@ -1,0 +1,56 @@
+name: Windows Native Terminal POC
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/native-windows-control-room
+    paths:
+      - "src/prime_harness/phase1_poc/**"
+      - ".github/workflows/windows-native-poc.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compile-native-poc:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify POC source is committed
+        shell: pwsh
+        run: |
+          $source = "src/prime_harness/phase1_poc/phase1_poc_terminal.cpp"
+          if (!(Test-Path $source)) { throw "POC source missing from GitHub. Push the local files first." }
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile native Win32 POC source (object only)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE /c /Fo:dist/phase1_poc_terminal.obj src/prime_harness/phase1_poc/phase1_poc_terminal.cpp
+          if ($LASTEXITCODE -ne 0) { throw "MSVC compilation failed: $LASTEXITCODE" }
+          if (!(Test-Path dist/phase1_poc_terminal.obj)) { throw "Object file not produced" }
+      - name: Build runnable ConPTY console smoke test
+        shell: pwsh
+        run: |
+          cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE /Fe:dist/prime-harness-terminal-poc.exe src/prime_harness/phase1_poc/conpty_console_smoke.cpp
+          if ($LASTEXITCODE -ne 0) { throw "ConPTY executable compilation failed: $LASTEXITCODE" }
+          if (!(Test-Path dist/prime-harness-terminal-poc.exe)) { throw "Executable not produced" }
+      - name: Upload runnable smoke-test executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-harness-conpty-smoke-windows-x64
+          path: dist/prime-harness-terminal-poc.exe
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload compiled POC object
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-harness-native-poc-object-windows-x64
+          path: dist/phase1_poc_terminal.obj
+          if-no-files-found: error
+          retention-days: 14

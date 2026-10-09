@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,11 +31,19 @@ class TerminalSlot:
 
 
 class TerminalManager:
-    """Six isolated CMD sessions. The manager must outlive the browser UI."""
+    """Independent CMD sessions, owned by the host rather than any UI."""
 
-    def __init__(self, count: int = 6, cwd: Path | None = None):
+    def __init__(self, count: int = 4, cwd: Path | None = None):
         self.cwd = str((cwd or Path.home()).resolve())
         self.slots = {i: TerminalSlot(i) for i in range(1, count + 1)}
+        self._slots_lock = threading.RLock()
+
+    def add_slot(self) -> int:
+        """Allocate another independent terminal; caller launches and pairs it."""
+        with self._slots_lock:
+            slot_id = max(self.slots, default=0) + 1
+            self.slots[slot_id] = TerminalSlot(slot_id)
+            return slot_id
 
     def slot(self, slot_id: int) -> TerminalSlot:
         if slot_id not in self.slots:
@@ -108,3 +117,64 @@ class TerminalManager:
         if slot.alive:
             with slot.lock:
                 slot.process.setwinsize(rows, cols)  # type: ignore[union-attr]
+
+    def shutdown(self, slot_ids: list[int] | None = None) -> dict[int, bool]:
+        """Reliable process-tree shutdown for ConPTY sessions.
+
+        Terminates only slots owned by this manager. Uses bounded
+        waits and verifies termination rather than arbitrary sleep.
+        Clears subscribers and nulls process references so that
+        temporary directories (cwd) can be removed.
+        """
+        results: dict[int, bool] = {}
+        targets = slot_ids if slot_ids is not None else list(self.slots)
+        for sid in targets:
+            if sid not in self.slots:
+                results[sid] = False
+                continue
+            slot = self.slots[sid]
+            terminated = False
+            with slot.lock:
+                # Clear subscriber queues to drop references to external objects
+                slot.subscribers.clear()
+                if slot.process is not None:
+                    try:
+                        if bool(slot.process.isalive()):  # type: ignore[union-attr]
+                            # Prefer graceful terminate; fall back to kill
+                            try:
+                                slot.process.terminate()  # type: ignore[union-attr]
+                            except Exception:
+                                pass
+                            # Bounded wait (max ~2s) with verification
+                            start = time.time()
+                            while time.time() - start < 2.0:
+                                if not bool(slot.process.isalive()):  # type: ignore[union-attr]
+                                    terminated = True
+                                    break
+                                time.sleep(0.05)
+                            if not terminated:
+                                try:
+                                    slot.process.kill()  # type: ignore[union-attr]
+                                except Exception:
+                                    pass
+                                # Second bounded wait
+                                start2 = time.time()
+                                while time.time() - start2 < 1.0:
+                                    if not bool(slot.process.isalive()):  # type: ignore[union-attr]
+                                        terminated = True
+                                        break
+                                    time.sleep(0.05)
+                            else:
+                                terminated = True
+                        else:
+                            terminated = True
+                    except Exception:
+                        pass
+                    # Null reference to allow GC and handle release
+                    slot.process = None
+                    slot.recent.clear()
+                else:
+                    # Already cleaned / never started; treat as terminated for cleanup
+                    terminated = True
+            results[sid] = terminated
+        return results
