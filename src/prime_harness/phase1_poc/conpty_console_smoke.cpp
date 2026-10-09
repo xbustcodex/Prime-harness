@@ -15,6 +15,9 @@
 #include <mutex>
 #include <chrono>
 
+// OpenClipboard/GetClipboardData, GetAsyncKeyState and GetForegroundWindow live in user32.
+#pragma comment(lib, "user32.lib")
+
 using ClosePseudoConsoleFn = void (WINAPI*)(HPCON);
 using CreatePseudoConsoleFn = HRESULT (WINAPI*)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
 using ResizePseudoConsoleFn = HRESULT (WINAPI*)(HPCON, COORD);
