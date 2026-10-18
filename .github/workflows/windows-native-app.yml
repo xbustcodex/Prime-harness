@@ -66,7 +66,21 @@ jobs:
             $index = curl.exe -s --noproxy "*" -o NUL -w "%{http_code}" --max-time 3 http://127.0.0.1:8421/
             if ($LASTEXITCODE -eq 0 -and $index -eq "200") { break }
           }
-          if ($index -ne "200") { throw "Control API index returned '$index' instead of 200" }
+          if ($index -ne "200") {
+            Write-Host "--- listeners on 8421:"
+            netstat -ano | Select-String ":8421" | ForEach-Object { Write-Host $_ }
+            Write-Host "--- processes:"
+            tasklist /FI "IMAGENAME eq PrimeHarnessControlRoom.exe"
+            Write-Host "--- ci uvicorn version:"
+            python -c "import uvicorn; print(uvicorn.__version__)"
+            Write-Host "--- app state file:"
+            if (Test-Path $env:PRIME_HARNESS_STATE) {
+              Get-Content $env:PRIME_HARNESS_STATE -Raw | Write-Host
+            } else {
+              Write-Host "NO STATE FILE"
+            }
+            throw "Control API index returned '$index' instead of 200"
+          }
           $unauth = curl.exe -s --noproxy "*" -o NUL -w "%{http_code}" --max-time 3 http://127.0.0.1:8421/api/sessions
           if ($unauth -ne "401") { throw "Expected 401 without token, got '$unauth'" }
           Stop-Process -Id $process.Id -Force
