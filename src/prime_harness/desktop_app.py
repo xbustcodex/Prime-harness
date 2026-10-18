@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
@@ -1108,12 +1109,33 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _write_startup_note(state_path: Path, note: str) -> None:
+    """Append one launch diagnostic next to the state file (ops visibility)."""
+    try:
+        with (state_path.parent / f"{state_path.name}.startup.log").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(f"{datetime.now().isoformat(timespec='seconds')} {note}\n")
+    except OSError:
+        pass
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    if os.environ.get("PRIME_HARNESS_API_AUTOSTART", "").lower() in {"1", "true", "yes"}:
-        window._start_api()
+    raw_autostart = os.environ.get("PRIME_HARNESS_API_AUTOSTART", "<unset>")
+    _write_startup_note(window.state_path, f"autostart env={raw_autostart!r}")
+    if raw_autostart.lower() in {"1", "true", "yes"}:
+        try:
+            window._start_api()
+            running = window.api_server.running if window.api_server else False
+            _write_startup_note(window.state_path, f"api start requested, running={running}")
+        except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+            _write_startup_note(window.state_path, f"api start FAILED: {exc!r}")
+            raise
+    else:
+        _write_startup_note(window.state_path, "autostart not requested")
     return app.exec()
 
 

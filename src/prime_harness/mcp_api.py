@@ -456,7 +456,11 @@ class ApiServer:
             return False
         import uvicorn
 
-        config = uvicorn.Config(self.app, host=self.host, port=self.port, log_level="warning")
+        # log_config=None: a windowed PyInstaller child may have sys.stderr=None,
+        # and uvicorn's default log config fails to bind ext://sys.stderr there.
+        config = uvicorn.Config(
+            self.app, host=self.host, port=self.port, log_level="warning", log_config=None
+        )
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(
             target=self._server.run, name="prime-harness-api", daemon=True

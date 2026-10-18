@@ -79,6 +79,12 @@ jobs:
             } else {
               Write-Host "NO STATE FILE"
             }
+            Write-Host "--- app startup log:"
+            if (Test-Path ($env:PRIME_HARNESS_STATE + ".startup.log")) {
+              Get-Content ($env:PRIME_HARNESS_STATE + ".startup.log") -Raw | Write-Host
+            } else {
+              Write-Host "NO STARTUP LOG"
+            }
             throw "Control API index returned '$index' instead of 200"
           }
           $unauth = curl.exe -s --noproxy "*" -o NUL -w "%{http_code}" --max-time 3 http://127.0.0.1:8421/api/sessions
