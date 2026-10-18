@@ -34,12 +34,12 @@ jobs:
           python -m pip install -e ".[windows,desktop,packaging,dev]"
           if ($LASTEXITCODE -ne 0) { throw "pip install failed: $LASTEXITCODE" }
 
-      - name: Run automated tests (VT engine, supervisor, ConPTY, Qt layout)
+      - name: Run automated tests (VT, supervisor, ConPTY, Qt layout, control room API)
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          python -m pytest tests/test_vt_engine.py tests/test_supervisor_and_sessions.py tests/test_live_conpty_and_desktop.py -rs
+          python -m pytest tests/test_vt_engine.py tests/test_supervisor_and_sessions.py tests/test_live_conpty_and_desktop.py tests/test_responsive_layout.py tests/test_control_room_api.py -rs
           if ($LASTEXITCODE -ne 0) { throw "tests failed: $LASTEXITCODE" }
 
       - name: Build desktop executable
@@ -49,15 +49,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
           if (!(Test-Path dist/PrimeHarnessControlRoom.exe)) { throw "Executable not produced" }
 
-      - name: Smoke-launch executable
+      - name: Smoke-launch executable and probe the control API
         shell: pwsh
         env:
           PRIME_HARNESS_STATE: ${{ github.workspace }}\ci-smoke-state.json
+          PRIME_HARNESS_API_AUTOSTART: "1"
+          PRIME_HARNESS_API_PORT: "8421"
         run: |
           $process = Start-Process -FilePath dist/PrimeHarnessControlRoom.exe -PassThru
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 14
           $process.Refresh()
           if ($process.HasExited) { throw "Application exited early with code $($process.ExitCode)" }
+          $index = curl.exe -s -o $null -w "%{http_code}" --max-time 5 http://127.0.0.1:8421/
+          if ($index -ne "200") { throw "Control API index returned '$index' instead of 200" }
+          $unauth = curl.exe -s -o $null -w "%{http_code}" --max-time 5 http://127.0.0.1:8421/api/sessions
+          if ($unauth -ne "401") { throw "Expected 401 without token, got '$unauth'" }
           Stop-Process -Id $process.Id -Force
           Get-Process PrimeHarnessControlRoom -ErrorAction SilentlyContinue | Stop-Process -Force
 
