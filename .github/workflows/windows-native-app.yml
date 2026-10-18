@@ -1,0 +1,101 @@
+name: Windows Native App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/native-windows-control-room
+    paths:
+      - "src/prime_harness/**"
+      - "tests/**"
+      - "build_exe.py"
+      - "pyproject.toml"
+      - ".github/workflows/windows-native-app.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-native-app:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[windows,desktop,packaging,dev]"
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed: $LASTEXITCODE" }
+
+      - name: Run automated tests (VT, supervisor, ConPTY, Qt layout, control room API)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest tests/test_vt_engine.py tests/test_supervisor_and_sessions.py tests/test_live_conpty_and_desktop.py tests/test_responsive_layout.py tests/test_control_room_api.py -rs
+          if ($LASTEXITCODE -ne 0) { throw "tests failed: $LASTEXITCODE" }
+
+      - name: Build desktop executable
+        shell: pwsh
+        run: |
+          python build_exe.py
+          if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
+          if (!(Test-Path dist/PrimeHarnessControlRoom.exe)) { throw "Executable not produced" }
+
+      - name: Smoke-launch executable and probe the control API
+        shell: pwsh
+        env:
+          PRIME_HARNESS_STATE: ${{ github.workspace }}\ci-smoke-state.json
+          PRIME_HARNESS_API_AUTOSTART: "1"
+          PRIME_HARNESS_API_PORT: "8421"
+        run: |
+          $process = Start-Process -FilePath dist/PrimeHarnessControlRoom.exe -PassThru
+          Get-ChildItem env: | Where-Object { $_.Name -match '(?i)proxy' } | Out-String | Write-Host
+          $index = ""
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            $process.Refresh()
+            if ($process.HasExited) { throw "Application exited early with code $($process.ExitCode)" }
+            $index = curl.exe -s --noproxy "*" -o NUL -w "%{http_code}" --max-time 3 http://127.0.0.1:8421/
+            if ($LASTEXITCODE -eq 0 -and $index -eq "200") { break }
+          }
+          if ($index -ne "200") {
+            Write-Host "--- listeners on 8421:"
+            netstat -ano | Select-String ":8421" | ForEach-Object { Write-Host $_ }
+            Write-Host "--- processes:"
+            tasklist /FI "IMAGENAME eq PrimeHarnessControlRoom.exe"
+            Write-Host "--- ci uvicorn version:"
+            python -c "import uvicorn; print(uvicorn.__version__)"
+            Write-Host "--- app state file:"
+            if (Test-Path $env:PRIME_HARNESS_STATE) {
+              Get-Content $env:PRIME_HARNESS_STATE -Raw | Write-Host
+            } else {
+              Write-Host "NO STATE FILE"
+            }
+            Write-Host "--- app startup log:"
+            if (Test-Path ($env:PRIME_HARNESS_STATE + ".startup.log")) {
+              Get-Content ($env:PRIME_HARNESS_STATE + ".startup.log") -Raw | Write-Host
+            } else {
+              Write-Host "NO STARTUP LOG"
+            }
+            throw "Control API index returned '$index' instead of 200"
+          }
+          $unauth = curl.exe -s --noproxy "*" -o NUL -w "%{http_code}" --max-time 3 http://127.0.0.1:8421/api/sessions
+          if ($unauth -ne "401") { throw "Expected 401 without token, got '$unauth'" }
+          Stop-Process -Id $process.Id -Force
+          Get-Process PrimeHarnessControlRoom -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Upload desktop executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-harness-control-room-windows-x64
+          path: dist/PrimeHarnessControlRoom.exe
+          if-no-files-found: error
+          retention-days: 14

@@ -14,7 +14,13 @@ dependencies = [
 
 [project.optional-dependencies]
 windows = ["pywinpty>=2.0,<3.0"]
+desktop = ["PySide6>=6.7,<7.0", "pyte>=0.8,<1.0", "pywinpty>=2.0,<3.0"]
+packaging = ["pyinstaller>=6.10,<7.0"]
 dev = ["ruff>=0.5,<1.0", "mypy>=1.7,<2.0", "httpx2>=2.13,<3.0"]
+
+[[tool.mypy.overrides]]
+module = "winpty"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
