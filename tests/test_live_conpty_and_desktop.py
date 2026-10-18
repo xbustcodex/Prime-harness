@@ -22,8 +22,9 @@ def _wait_for(predicate, timeout: float) -> bool:
 
 @pytest.mark.skipif(not WINDOWS, reason="ConPTY requires Windows")
 def test_live_conpty_cmd_round_trip_and_exit_code():
-    session = PtySession("live-cmd", ["cmd.exe", "/d", "/c", "echo PH_LIVE_OK && exit 3"],
-                         rows=24, cols=100)
+    session = PtySession(
+        "live-cmd", ["cmd.exe", "/d", "/c", "echo PH_LIVE_OK && exit 3"], rows=24, cols=100
+    )
     assert session.start(), session.error
     vt = VtScreen(24, 100)
     assert _wait_for(lambda: session.state is SessionState.EXITED, 15)
@@ -41,8 +42,10 @@ def test_live_interactive_input_is_echoed_through_vt_engine():
         time.sleep(1.0)
         session.write("echo PH_TYPED_42\r")
         found = _wait_for(
-            lambda: (vt.feed(session.drain()) or True) and any(
-                "PH_TYPED_42" in line for line in vt.active.display),
+            lambda: (
+                (vt.feed(session.drain()) or True)
+                and any("PH_TYPED_42" in line for line in vt.active.display)
+            ),
             10,
         )
         assert found
@@ -75,8 +78,9 @@ def test_live_omp_renders_full_screen_interface():
                 break
             time.sleep(0.1)
         assert vt.in_alt, "OMP did not enter the alternate screen"
-        assert any(ch in "┌┐└┘│─" for line in vt.active.display for ch in line), \
+        assert any(ch in "┌┐└┘│─" for line in vt.active.display for ch in line), (
             "OMP box-drawing borders not rendered"
+        )
     finally:
         session.stop(timeout=5)
 

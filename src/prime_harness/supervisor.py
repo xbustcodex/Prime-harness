@@ -132,7 +132,8 @@ class Supervisor:
 
     def queue_for(self, session_id: str) -> list[QueuedCommand]:
         return [
-            c for c in self.commands
+            c
+            for c in self.commands
             if c.session_id == session_id and c.status in {"awaiting approval", "queued"}
         ]
 

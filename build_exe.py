@@ -37,7 +37,9 @@ def main() -> int:
         return 1
 
     cmd = [
-        sys.executable, "-m", "PyInstaller",
+        sys.executable,
+        "-m",
+        "PyInstaller",
         "--noconfirm",
         "--clean",
         f"--name={APP_NAME}",
@@ -48,7 +50,8 @@ def main() -> int:
         str(ENTRY),
     ]
     print("Running:", " ".join(cmd))
-    result = subprocess.run(cmd, cwd=PROJECT, check=False)
+    # Fixed PyInstaller argv built from sys.executable; no shell and no untrusted input.
+    result = subprocess.run(cmd, cwd=PROJECT, check=False)  # noqa: S603
     if result.returncode != 0:
         print(f"PyInstaller failed with exit code {result.returncode}")
         return result.returncode

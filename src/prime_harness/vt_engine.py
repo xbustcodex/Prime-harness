@@ -61,7 +61,7 @@ class VtScreen:
         self._pending = ""
         tail = _INCOMPLETE_TAIL_RE.search(data)
         if tail:
-            self._pending = data[tail.start():]
+            self._pending = data[tail.start() :]
             data = data[: tail.start()]
         for match in _MODE_RE.finditer(data):
             self._apply_modes(match.group(1), match.group(2) == "h")

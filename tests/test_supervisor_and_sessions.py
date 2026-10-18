@@ -90,8 +90,11 @@ def test_builtin_profiles_present_and_custom_profile_loads(tmp_path):
 
 
 class _FakeProcess:
-    def __init__(self, chunks):
+    """Fake PtyProcess. With exit_on_empty=False it stays alive until terminated."""
+
+    def __init__(self, chunks, exit_on_empty=True):
         self._chunks = list(chunks)
+        self._exit_on_empty = exit_on_empty
         self.pid = 4242
         self.written: list[str] = []
         self.size = None
@@ -101,8 +104,11 @@ class _FakeProcess:
     def read(self, _n):
         if self._chunks:
             return self._chunks.pop(0)
-        self._alive = False
-        raise EOFError
+        if self._exit_on_empty:
+            self._alive = False
+            raise EOFError
+        time.sleep(0.01)
+        return ""
 
     def isalive(self):
         return self._alive
@@ -129,8 +135,9 @@ def _fake_spawner(process):
 def test_session_reads_output_and_reports_exit():
     process = _FakeProcess(["hello ", "world"])
     spawner = _fake_spawner(process)
-    session = PtySession("s1", ["cmd"], cwd="C:/x", env={"PH_TEST": "1"},
-                         rows=10, cols=40, spawner=spawner)
+    session = PtySession(
+        "s1", ["cmd"], cwd="C:/x", env={"PH_TEST": "1"}, rows=10, cols=40, spawner=spawner
+    )
     assert session.start()
     deadline = time.monotonic() + 2
     while session.state is SessionState.RUNNING and time.monotonic() < deadline:
@@ -145,7 +152,7 @@ def test_session_reads_output_and_reports_exit():
 
 
 def test_session_write_and_resize_only_while_running():
-    process = _FakeProcess([])
+    process = _FakeProcess([], exit_on_empty=False)
     session = PtySession("s2", ["cmd"], spawner=_fake_spawner(process))
     assert not session.write("dir\r")
     session.start()

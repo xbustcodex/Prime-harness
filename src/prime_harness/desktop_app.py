@@ -38,7 +38,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from prime_harness.persistence import AppState, PanelConfig, default_state_path, load_state, save_state
+from prime_harness.persistence import (
+    AppState,
+    PanelConfig,
+    default_state_path,
+    load_state,
+    save_state,
+)
 from prime_harness.profiles import LaunchProfile, find_profile, resolve_argv
 from prime_harness.pty_session import PtySession, SessionState
 from prime_harness.supervisor import CHAT_HELP, Supervisor
@@ -51,11 +57,23 @@ FIXED_PANEL_IDS = ("1", "2", "3", "4")
 DEFAULT_FG = "#d4d4d4"
 DEFAULT_BG = "#1e1e1e"
 ANSI_COLORS = {
-    "black": "#000000", "red": "#cd3131", "green": "#0dbc79", "brown": "#e5e510",
-    "yellow": "#e5e510", "blue": "#2472c8", "magenta": "#bc3fbc", "cyan": "#11a8cd",
-    "white": "#e5e5e5", "brightblack": "#666666", "brightred": "#f14c4c",
-    "brightgreen": "#23d18b", "brightbrown": "#f5f543", "brightyellow": "#f5f543",
-    "brightblue": "#3b8eea", "brightmagenta": "#d670d6", "brightcyan": "#29b8db",
+    "black": "#000000",
+    "red": "#cd3131",
+    "green": "#0dbc79",
+    "brown": "#e5e510",
+    "yellow": "#e5e510",
+    "blue": "#2472c8",
+    "magenta": "#bc3fbc",
+    "cyan": "#11a8cd",
+    "white": "#e5e5e5",
+    "brightblack": "#666666",
+    "brightred": "#f14c4c",
+    "brightgreen": "#23d18b",
+    "brightbrown": "#f5f543",
+    "brightyellow": "#f5f543",
+    "brightblue": "#3b8eea",
+    "brightmagenta": "#d670d6",
+    "brightcyan": "#29b8db",
     "brightwhite": "#ffffff",
 }
 
@@ -149,8 +167,11 @@ class TerminalView(QWidget):
         if self.session is None and self.placeholder:
             painter.setPen(QColor("#888888"))
             painter.setFont(self._font)
-            painter.drawText(QRectF(8, 8, self.width() - 16, self.height() - 16),
-                             int(Qt.TextFlag.TextWordWrap), self.placeholder)
+            painter.drawText(
+                QRectF(8, 8, self.width() - 16, self.height() - 16),
+                int(Qt.TextFlag.TextWordWrap),
+                self.placeholder,
+            )
             painter.end()
             return
         painter.setFont(self._font)
@@ -222,8 +243,9 @@ class TerminalView(QWidget):
             return
         name = _KEY_NAMES.get(key)
         if name is not None:
-            sequence = encode_key(name, app_cursor=self.vt.app_cursor,
-                                  shift=shift, alt=alt, ctrl=ctrl)
+            sequence = encode_key(
+                name, app_cursor=self.vt.app_cursor, shift=shift, alt=alt, ctrl=ctrl
+            )
             if sequence is not None:
                 self.send(sequence)
             return
@@ -302,7 +324,12 @@ class TerminalPanel(QFrame):
         self.status = QLabel("Not started")
         header.addWidget(QLabel(f"Terminal {panel_id}"))
         header.addWidget(self.profile_box)
-        for button in (self.start_button, self.stop_button, self.restart_button, self.folder_button):
+        for button in (
+            self.start_button,
+            self.stop_button,
+            self.restart_button,
+            self.folder_button,
+        ):
             header.addWidget(button)
         header.addWidget(self.status, 1)
         layout.addLayout(header)
@@ -324,7 +351,9 @@ class SupervisorChat(QFrame):
         self.log.setMaximumBlockCount(1000)
         self.target_box = QComboBox()
         self.input = QLineEdit()
-        self.input.setPlaceholderText("Plain text goes to the selected terminal. /help for commands.")
+        self.input.setPlaceholderText(
+            "Plain text goes to the selected terminal. /help for commands."
+        )
         self.send_button = QPushButton("Send")
         self.pause_button = QPushButton("Pause")
         self.resume_button = QPushButton("Resume")
@@ -334,8 +363,13 @@ class SupervisorChat(QFrame):
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Target:"))
         controls.addWidget(self.target_box, 1)
-        for button in (self.pause_button, self.resume_button, self.review_button,
-                       self.stop_button, self.restart_button):
+        for button in (
+            self.pause_button,
+            self.resume_button,
+            self.review_button,
+            self.stop_button,
+            self.restart_button,
+        ):
             controls.addWidget(button)
         entry = QHBoxLayout()
         entry.addWidget(self.input, 1)
@@ -409,7 +443,8 @@ class MainWindow(QMainWindow):
         configured = {p.panel_id: p for p in self.state.panels}
         for index, panel_id in enumerate(FIXED_PANEL_IDS):
             config = configured.get(panel_id) or PanelConfig(
-                panel_id, DEFAULT_PANEL_PROFILES[index], self.state.default_cwd)
+                panel_id, DEFAULT_PANEL_PROFILES[index], self.state.default_cwd
+            )
             self._create_panel(config)
         self.top_row.addWidget(self.panels["1"])
         self.top_row.addWidget(self.panels["2"])
@@ -512,8 +547,9 @@ class MainWindow(QMainWindow):
 
     def choose_folder(self, panel_id: str) -> None:
         panel = self.panels[panel_id]
-        chosen = QFileDialog.getExistingDirectory(self, "Working directory",
-                                                  panel.cwd or str(Path.home()))
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Working directory", panel.cwd or str(Path.home())
+        )
         if chosen:
             panel.cwd = chosen
             panel.status.setText(f"Folder set: {chosen} (applies on next Start)")
@@ -554,7 +590,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_bar(self) -> None:
         unread = self.supervisor.unread_count()
-        self.notifications_button.setText(f"Notifications ({unread})" if unread else "Notifications")
+        self.notifications_button.setText(
+            f"Notifications ({unread})" if unread else "Notifications"
+        )
         running = sum(1 for p in self.panels.values() if p.session and p.session.running)
         self.bar_status.setText(f"{running} running · {len(self.panels)} terminals")
 
@@ -617,13 +655,18 @@ class MainWindow(QMainWindow):
             panel_id = ident or target or ""
             if panel_id in self.panels:
                 text = self.panels[panel_id].view.vt.plain_text(60) or "(no output yet)"
-                self.supervisor.log(f"--- Review Terminal {panel_id} (last 60 lines) ---\n{text}\n---")
+                self.supervisor.log(
+                    f"--- Review Terminal {panel_id} (last 60 lines) ---\n{text}\n---"
+                )
         elif action in ("pause", "resume"):
             panel_id = ident or target or ""
             if panel_id in self.panels:
                 self.supervisor.set_paused(panel_id, action == "pause")
-                note = ("Delivery of queued commands paused; the agent process keeps running."
-                        if action == "pause" else "Delivery resumed.")
+                note = (
+                    "Delivery of queued commands paused; the agent process keeps running."
+                    if action == "pause"
+                    else "Delivery resumed."
+                )
                 self.supervisor.log(f"[{panel_id}] {note}")
         elif action in ("stop", "restart"):
             panel_id = ident or target or ""
@@ -636,8 +679,9 @@ class MainWindow(QMainWindow):
             for panel_id, panel in self.panels.items():
                 state = panel.session.state.value if panel.session else "not started"
                 paused = " (paused)" if self.supervisor.sessions[panel_id].paused else ""
-                self.supervisor.log(f"Terminal {panel_id}: {state}{paused} · "
-                                    f"{panel.profile_box.currentText()}")
+                self.supervisor.log(
+                    f"Terminal {panel_id}: {state}{paused} · {panel.profile_box.currentText()}"
+                )
         elif action == "help":
             self.supervisor.log(CHAT_HELP)
         else:
@@ -655,8 +699,12 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         for panel_id, panel in self.panels.items():
             state = panel.session.state.value if panel.session else "not started"
-            action = menu.addAction(f"Terminal {panel_id} · {panel.profile_box.currentText()} · {state}")
-            action.triggered.connect(lambda _checked=False, pid=panel_id: self._select_from_menu(pid))
+            action = menu.addAction(
+                f"Terminal {panel_id} · {panel.profile_box.currentText()} · {state}"
+            )
+            action.triggered.connect(
+                lambda _checked=False, pid=panel_id: self._select_from_menu(pid)
+            )
         menu.exec(self.sessions_button.mapToGlobal(self.sessions_button.rect().bottomLeft()))
 
     def _select_from_menu(self, panel_id: str) -> None:
@@ -666,8 +714,12 @@ class MainWindow(QMainWindow):
 
     def _show_notifications(self) -> None:
         items = self.supervisor.notifications[-50:]
-        text = "\n".join(f"[{n.created_at}] Terminal {n.session_id}: {n.kind} — {n.message}"
-                         for n in items) or "No notifications."
+        text = (
+            "\n".join(
+                f"[{n.created_at}] Terminal {n.session_id}: {n.kind} — {n.message}" for n in items
+            )
+            or "No notifications."
+        )
         self.supervisor.mark_all_read()
         self._refresh_bar()
         QMessageBox.information(self, "Notifications", text)

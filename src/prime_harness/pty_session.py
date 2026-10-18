@@ -13,7 +13,8 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
+from typing import Any
 
 try:
     from winpty import PtyProcess
@@ -21,7 +22,7 @@ except ImportError:  # non-Windows environments: tests use fakes
     PtyProcess = None  # type: ignore[assignment,misc]
 
 
-class SessionState(str, Enum):
+class SessionState(StrEnum):
     NOT_STARTED = "not started"
     RUNNING = "running"
     EXITED = "exited"
@@ -42,7 +43,7 @@ class PtySession:
     state: SessionState = SessionState.NOT_STARTED
     exit_code: int | None = None
     error: str = ""
-    _process: object | None = None
+    _process: Any = None  # duck-typed pywinpty PtyProcess handle
     _chunks: queue.Queue[str] = field(default_factory=queue.Queue)
     _reader: threading.Thread | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock)
@@ -65,14 +66,18 @@ class PtySession:
             try:
                 if self.spawner is not None:
                     process = self.spawner(  # type: ignore[operator]
-                        list(self.argv), cwd=self.cwd, env=environment,
+                        list(self.argv),
+                        cwd=self.cwd,
+                        env=environment,
                         dimensions=(self.rows, self.cols),
                     )
                 else:
                     if PtyProcess is None:
                         raise RuntimeError("pywinpty is required for ConPTY sessions")
                     process = PtyProcess.spawn(
-                        list(self.argv), cwd=self.cwd, env=environment,
+                        list(self.argv),
+                        cwd=self.cwd,
+                        env=environment,
                         dimensions=(self.rows, self.cols),
                     )
             except Exception as exc:  # noqa: BLE001 - surfaced to the operator
@@ -163,16 +168,24 @@ class PtySession:
                 return True
             pid = getattr(process, "pid", None)
             if os.name == "nt" and pid:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True, timeout=timeout, check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                taskkill = os.path.join(
+                    os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe"
                 )
-            else:
                 try:
-                    process.terminate(force=True)  # type: ignore[attr-defined]
-                except Exception:  # noqa: BLE001
-                    pass
+                    # Fixed argv, integer PID, no shell: no untrusted input is interpolated.
+                    subprocess.run(  # noqa: S603
+                        [taskkill, "/PID", str(pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=timeout,
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    self.error = f"taskkill failed: {exc}"
+            try:
+                process.terminate(force=True)  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                self.error = f"Terminate failed: {exc}"
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and self._alive(process):
             time.sleep(0.05)
