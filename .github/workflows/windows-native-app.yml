@@ -1,0 +1,70 @@
+name: Windows Native App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/native-windows-control-room
+    paths:
+      - "src/prime_harness/**"
+      - "tests/**"
+      - "build_exe.py"
+      - "pyproject.toml"
+      - ".github/workflows/windows-native-app.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-native-app:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[windows,desktop,packaging,dev]"
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed: $LASTEXITCODE" }
+
+      - name: Run automated tests (VT engine, supervisor, ConPTY, Qt layout)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest tests/test_vt_engine.py tests/test_supervisor_and_sessions.py tests/test_live_conpty_and_desktop.py -rs
+          if ($LASTEXITCODE -ne 0) { throw "tests failed: $LASTEXITCODE" }
+
+      - name: Build desktop executable
+        shell: pwsh
+        run: |
+          python build_exe.py
+          if ($LASTEXITCODE -ne 0) { throw "build failed: $LASTEXITCODE" }
+          if (!(Test-Path dist/PrimeHarnessControlRoom.exe)) { throw "Executable not produced" }
+
+      - name: Smoke-launch executable
+        shell: pwsh
+        env:
+          PRIME_HARNESS_STATE: ${{ github.workspace }}\ci-smoke-state.json
+        run: |
+          $process = Start-Process -FilePath dist/PrimeHarnessControlRoom.exe -PassThru
+          Start-Sleep -Seconds 10
+          $process.Refresh()
+          if ($process.HasExited) { throw "Application exited early with code $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+          Get-Process PrimeHarnessControlRoom -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Upload desktop executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-harness-control-room-windows-x64
+          path: dist/PrimeHarnessControlRoom.exe
+          if-no-files-found: error
+          retention-days: 14

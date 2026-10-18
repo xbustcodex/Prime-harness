@@ -1,399 +1,704 @@
-"""Native Windows desktop control room.
+"""Prime Harness native Windows desktop application (Qt).
 
-Layout controller with four corner panels, centre supervisor chat,
-+ Add Terminal, and independent ConPTY session connections.
+Layout:
 
-RENDERER BLOCKER DOCUMENTED (docs/embedded_renderer_investigation.md):
-The panel display uses win32gui.DrawText (plain native text widget), not
-an embedded VT terminal emulator. Full ANSI/VT, alternate screen,
-cursor positioning, and synchronized-output rendering requires a real
-embedded renderer (Windows Terminal SDK / WPF Embedded Control),
-which is not available as a redistributable component in this environment.
-Do not claim OMP/PrimePi visual compatibility until that blocker is resolved.
+    [ Terminal 1 ][ Terminal 2 ]
+    [ Terminal 3 ][ Supervisor ][ Terminal 4 ]
+    [ extra terminals added with + Add Terminal ]
+    [ + Add Terminal | Sessions | Notifications ]
 
-All compatibility work stays in Prime Harness; OMP/PrimePi installations
-are never modified.
+Every terminal panel is a real embedded VT surface (prime_harness.vt_engine)
+fed by its own ConPTY session (prime_harness.pty_session). OMP, PrimePi,
+PowerShell, Command Prompt and custom profiles run unmodified.
 """
+
 from __future__ import annotations
 
-import threading
-import time
+import os
+import sys
 from pathlib import Path
 
-import win32api
-import win32con
-import win32gui
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
+)
 
-from prime_harness.terminal_control import TerminalManager, TerminalSlot
+from prime_harness.persistence import AppState, PanelConfig, default_state_path, load_state, save_state
+from prime_harness.profiles import LaunchProfile, find_profile, resolve_argv
+from prime_harness.pty_session import PtySession, SessionState
+from prime_harness.supervisor import CHAT_HELP, Supervisor
+from prime_harness.vt_engine import VtScreen, encode_key, encode_mouse, encode_paste, encode_text
 
-# Window class names
-WCLASS_PANEL = "PrimePanel"
-WCLASS_CHAT = "PrimeChat"
-WCLASS_ADD = "PrimeAddBtn"
+PUMP_INTERVAL_MS = 30
+DEFAULT_PANEL_PROFILES = ("omp", "primepi", "powershell", "cmd")
+FIXED_PANEL_IDS = ("1", "2", "3", "4")
 
-# Layout constants (pixels)
-MARGIN = 12
-PANEL_W = 560
-PANEL_H = 340
-CHAT_W = 320
-CHAT_H = 180
+DEFAULT_FG = "#d4d4d4"
+DEFAULT_BG = "#1e1e1e"
+ANSI_COLORS = {
+    "black": "#000000", "red": "#cd3131", "green": "#0dbc79", "brown": "#e5e510",
+    "yellow": "#e5e510", "blue": "#2472c8", "magenta": "#bc3fbc", "cyan": "#11a8cd",
+    "white": "#e5e5e5", "brightblack": "#666666", "brightred": "#f14c4c",
+    "brightgreen": "#23d18b", "brightbrown": "#f5f543", "brightyellow": "#f5f543",
+    "brightblue": "#3b8eea", "brightmagenta": "#d670d6", "brightcyan": "#29b8db",
+    "brightwhite": "#ffffff",
+}
 
+_KEY_NAMES: dict[int, str] = {
+    int(Qt.Key.Key_Return): "Enter",
+    int(Qt.Key.Key_Enter): "Enter",
+    int(Qt.Key.Key_Backspace): "Backspace",
+    int(Qt.Key.Key_Tab): "Tab",
+    int(Qt.Key.Key_Backtab): "Backtab",
+    int(Qt.Key.Key_Escape): "Escape",
+    int(Qt.Key.Key_Up): "Up",
+    int(Qt.Key.Key_Down): "Down",
+    int(Qt.Key.Key_Left): "Left",
+    int(Qt.Key.Key_Right): "Right",
+    int(Qt.Key.Key_Home): "Home",
+    int(Qt.Key.Key_End): "End",
+    int(Qt.Key.Key_Insert): "Insert",
+    int(Qt.Key.Key_Delete): "Delete",
+    int(Qt.Key.Key_PageUp): "PageUp",
+    int(Qt.Key.Key_PageDown): "PageDown",
+}
+for _index in range(1, 13):
+    _KEY_NAMES[int(getattr(Qt.Key, f"Key_F{_index}"))] = f"F{_index}"
 
-def _register_classes():
-    wc = win32gui.WNDCLASS()
-    wc.hInstance = win32gui.GetModuleHandle(None)
-    wc.lpszClassName = WCLASS_PANEL
-    wc.lpfnWndProc = _panel_wndproc
-    wc.hbrBackground = win32con.COLOR_WINDOW
-    wc.style = win32con.CS_DBLCLKS | win32con.CS_HREDRAW | win32con.CS_VREDRAW
-    win32gui.RegisterClass(wc)
-
-    wc_chat = win32gui.WNDCLASS()
-    wc_chat.hInstance = wc.hInstance
-    wc_chat.lpszClassName = WCLASS_CHAT
-    wc_chat.lpfnWndProc = _chat_wndproc
-    wc_chat.hbrBackground = win32con.COLOR_BTNFACE
-    wc_chat.style = win32con.CS_DBLCLKS
-    win32gui.RegisterClass(wc_chat)
-
-    wc_add = win32gui.WNDCLASS()
-    wc_add.hInstance = wc.hInstance
-    wc_add.lpszClassName = WCLASS_ADD
-    wc_add.lpfnWndProc = _add_wndproc
-    wc_add.hbrBackground = win32con.COLOR_WINDOW
-    wc_add.style = win32con.CS_DBLCLKS
-    win32gui.RegisterClass(wc_add)
-
-
-# ------------------------------------------------------------------
-# Panel (terminal) window procedure
-# ------------------------------------------------------------------
-_panel_buffers: dict[int, list[str]] = {}
-_panel_hwnds: dict[int, int] = {}
-
-
-def _panel_wndproc(hwnd, msg, wparam, lparam):
-    slot_id = win32gui.GetWindowLong(hwnd, win32con.GWL_USERDATA)
-    if msg == win32con.WM_DESTROY:
-        return 0
-    elif msg == win32con.WM_PAINT:
-        hdc = win32gui.BeginPaint(hwnd)
-        try:
-            rect = win32gui.GetClientRect(hwnd)
-            win32gui.FillRect(hdc, rect, win32gui.GetStockObject(win32con.WHITE_BRUSH))
-            # Draw panel label
-            label = f"CMD — Slot {slot_id}" if slot_id else "Empty"
-            win32gui.DrawText(hdc, label, -1, (8, 4, rect[2] - 8, 28),
-                              win32con.DT_LEFT | win32con.DT_SINGLELINE)
-            # Draw recent chunks (simplified display; true VT engine is verified separately)
-            lines = _panel_buffers.get(slot_id, [])
-            text = "".join(lines[-30:])
-            if text:
-                # NOTE: This is a plain native text widget (DrawText), not a VT
-                # terminal emulator. OMP/PrimePi visual compatibility is NOT
-                # genuinely established until a real embedded renderer is
-                # integrated (see docs/embedded_renderer_investigation.md).
-                win32gui.DrawText(hdc, text, -1, (8, 36, rect[2] - 8, rect[3] - 8),
-                                  win32con.DT_LEFT | win32con.DT_TOP | win32con.DT_WORDBREAK)
-        finally:
-            win32gui.EndPaint(hwnd, hdc)
-        return 0
-    elif msg == win32con.WM_SIZE:
-        # Debounced resize sync to ConPTY handled by layout controller
-        win32gui.InvalidateRect(hwnd, None, True)
-        return 0
-    return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+_MOUSE_BUTTONS = {
+    Qt.MouseButton.LeftButton: 0,
+    Qt.MouseButton.MiddleButton: 1,
+    Qt.MouseButton.RightButton: 2,
+}
 
 
-# ------------------------------------------------------------------
-# Chat window procedure (compact supervisor chat centre)
-# ------------------------------------------------------------------
-_chat_text: list[str] = [
-    "Supervisor chat — coordination UI only.",
-    "Not an extra terminal. Independent session pairing.",
-]
+def _resolve_color(name: str, default: str | None) -> QColor | None:
+    if not name or name == "default":
+        return QColor(default) if default else None
+    if name in ANSI_COLORS:
+        return QColor(ANSI_COLORS[name])
+    if len(name) == 6:
+        color = QColor(f"#{name}")
+        if color.isValid():
+            return color
+    return QColor(default) if default else None
 
 
-def _chat_wndproc(hwnd, msg, wparam, lparam):
-    if msg == win32con.WM_DESTROY:
-        return 0
-    elif msg == win32con.WM_PAINT:
-        hdc = win32gui.BeginPaint(hwnd)
-        try:
-            rect = win32gui.GetClientRect(hwnd)
-            win32gui.FillRect(hdc, rect, win32gui.GetStockObject(win32con.LTGRAY_BRUSH))
-            text = "\r\n".join(_chat_text)
-            win32gui.DrawText(hdc, text, -1, (8, 8, rect[2] - 8, rect[3] - 8),
-                              win32con.DT_LEFT | win32con.DT_TOP | win32con.DT_WORDBREAK)
-        finally:
-            win32gui.EndPaint(hwnd, hdc)
-        return 0
-    return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+class TerminalView(QWidget):
+    """Embedded VT surface: paints the grid, sends keyboard, mouse and paste input."""
+
+    focused_panel = Signal(str)
+
+    def __init__(self, panel_id: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.panel_id = panel_id
+        self.vt = VtScreen(24, 80)
+        self.session: PtySession | None = None
+        self.placeholder = ""
+        font = QFont("Cascadia Mono")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFixedPitch(True)
+        font.setPointSize(10)
+        self._font = font
+        self._bold = QFont(font)
+        self._bold.setBold(True)
+        metrics = QFontMetrics(font)
+        self.cell_w = max(1, metrics.horizontalAdvance("M"))
+        self.cell_h = max(1, metrics.height())
+        self._ascent = metrics.ascent()
+        self._button_down = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMinimumSize(self.cell_w * 20, self.cell_h * 5)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+    # ------------------------------------------------------------- grid
+    def sync_grid(self) -> None:
+        """Rows and columns come from the rendered character grid, not pixels."""
+        cols = max(20, self.width() // self.cell_w)
+        rows = max(5, self.height() // self.cell_h)
+        if (rows, cols) == (self.vt.rows, self.vt.cols):
+            return
+        self.vt.resize(rows, cols)
+        if self.session is not None:
+            self.session.resize(rows, cols)
+        self.update()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self.sync_grid()
+
+    # ------------------------------------------------------------ paint
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(DEFAULT_BG))
+        if self.session is None and self.placeholder:
+            painter.setPen(QColor("#888888"))
+            painter.setFont(self._font)
+            painter.drawText(QRectF(8, 8, self.width() - 16, self.height() - 16),
+                             int(Qt.TextFlag.TextWordWrap), self.placeholder)
+            painter.end()
+            return
+        painter.setFont(self._font)
+        cw, ch = self.cell_w, self.cell_h
+        for row_index, row in enumerate(self.vt.render_rows()):
+            y = row_index * ch
+            for col_index, cell in enumerate(row):
+                x = col_index * cw
+                if cell.reverse:
+                    fg = _resolve_color(cell.bg, DEFAULT_BG) or QColor(DEFAULT_BG)
+                    bg = _resolve_color(cell.fg, DEFAULT_FG)
+                else:
+                    fg = _resolve_color(cell.fg, DEFAULT_FG) or QColor(DEFAULT_FG)
+                    bg = _resolve_color(cell.bg, None)
+                if bg is not None:
+                    painter.fillRect(x, y, cw, ch, bg)
+                if cell.data and cell.data != " ":
+                    painter.setPen(fg)
+                    painter.setFont(self._bold if cell.bold else self._font)
+                    painter.drawText(QPointF(x, y + self._ascent), cell.data)
+                if cell.underscore:
+                    painter.setPen(fg)
+                    painter.drawLine(x, y + ch - 1, x + cw - 1, y + ch - 1)
+        row, col, cursor_visible = self.vt.cursor
+        if cursor_visible and self.hasFocus():
+            painter.fillRect(col * cw, row * ch, cw, ch, QColor(200, 200, 200, 110))
+        painter.setPen(QColor("#3b8eea") if self.hasFocus() else QColor("#333333"))
+        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+        painter.end()
+
+    # ------------------------------------------------------------ focus
+    def focusInEvent(self, event) -> None:  # noqa: N802
+        super().focusInEvent(event)
+        self.focused_panel.emit(self.panel_id)
+        self.update()
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        super().focusOutEvent(event)
+        self.update()
+
+    # ------------------------------------------------------------ input
+    def send(self, data: str) -> None:
+        if data and self.session is not None and self.session.running:
+            self.vt.scroll_to_bottom()
+            self.session.write(data)
+
+    def paste_from_clipboard(self) -> None:
+        text = QApplication.clipboard().text()
+        if text:
+            self.send(encode_paste(text, bracketed=self.vt.bracketed_paste))
+
+    def copy_visible(self) -> None:
+        QApplication.clipboard().setText(self.vt.plain_text(self.vt.rows))
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        modifiers = event.modifiers()
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        alt = bool(modifiers & Qt.KeyboardModifier.AltModifier)
+        key = event.key()
+        if ctrl and shift and key == int(Qt.Key.Key_V):
+            self.paste_from_clipboard()
+            return
+        if ctrl and shift and key == int(Qt.Key.Key_C):
+            self.copy_visible()
+            return
+        if shift and key == int(Qt.Key.Key_Insert):
+            self.paste_from_clipboard()
+            return
+        name = _KEY_NAMES.get(key)
+        if name is not None:
+            sequence = encode_key(name, app_cursor=self.vt.app_cursor,
+                                  shift=shift, alt=alt, ctrl=ctrl)
+            if sequence is not None:
+                self.send(sequence)
+            return
+        text = event.text()
+        if text:
+            self.send(encode_text(text, alt=alt))
+
+    # ------------------------------------------------------------ mouse
+    def _cell_at(self, pos) -> tuple[int, int]:
+        col = min(max(0, int(pos.x()) // self.cell_w), self.vt.cols - 1)
+        row = min(max(0, int(pos.y()) // self.cell_h), self.vt.rows - 1)
+        return col, row
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        button = _MOUSE_BUTTONS.get(event.button())
+        if button is not None and self.vt.mouse_level:
+            col, row = self._cell_at(event.position())
+            self.send(encode_mouse(button, col, row, press=True, sgr=self.vt.mouse_sgr))
+            self._button_down = True
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        button = _MOUSE_BUTTONS.get(event.button())
+        if button is not None and self.vt.mouse_level and self._button_down:
+            col, row = self._cell_at(event.position())
+            self.send(encode_mouse(button, col, row, press=False, sgr=self.vt.mouse_sgr))
+        self._button_down = False
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        level = self.vt.mouse_level
+        if level == 1003 or (level == 1002 and self._button_down):
+            col, row = self._cell_at(event.position())
+            self.send(encode_mouse(0, col, row, press=True, motion=True, sgr=self.vt.mouse_sgr))
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        steps = event.angleDelta().y() // 120
+        if not steps:
+            return
+        if self.vt.mouse_level:
+            col, row = self._cell_at(event.position())
+            button = 64 if steps > 0 else 65
+            for _ in range(abs(steps)):
+                self.send(encode_mouse(button, col, row, press=True, sgr=self.vt.mouse_sgr))
+        else:
+            self.vt.scroll_by(steps * 3)
+            self.update()
+
+    def feed(self, text: str) -> None:
+        if text:
+            self.vt.feed(text)
+            self.update()
 
 
-# ------------------------------------------------------------------
-# Add button window procedure
-# ------------------------------------------------------------------
-def _add_wndproc(hwnd, msg, wparam, lparam):
-    if msg == win32con.WM_LBUTTONUP:
-        # Trigger layout reflow via global reference (set in main)
-        if hasattr(_add_wndproc, "_app_ref") and _add_wndproc._app_ref:
-            _add_wndproc._app_ref.add_terminal()
-        return 0
-    elif msg == win32con.WM_PAINT:
-        hdc = win32gui.BeginPaint(hwnd)
-        try:
-            rect = win32gui.GetClientRect(hwnd)
-            win32gui.FillRect(hdc, rect, win32gui.GetStockObject(win32con.BTNFACE))
-            win32gui.DrawText(hdc, "+ Add Terminal", -1, rect,
-                              win32con.DT_CENTER | win32con.DT_VCENTER | win32con.DT_SINGLELINE)
-        finally:
-            win32gui.EndPaint(hwnd, hdc)
-        return 0
-    return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+class TerminalPanel(QFrame):
+    """Header (profile, status, controls) above one embedded terminal view."""
+
+    def __init__(self, panel_id: str, profiles: list[LaunchProfile], parent=None) -> None:
+        super().__init__(parent)
+        self.panel_id = panel_id
+        self.cwd = ""
+        self.session: PtySession | None = None
+        self.reported_exit = False
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        self.profile_box = QComboBox()
+        for profile in profiles:
+            self.profile_box.addItem(profile.name, profile.profile_id)
+        self.start_button = QPushButton("Start")
+        self.stop_button = QPushButton("Stop")
+        self.restart_button = QPushButton("Restart")
+        self.folder_button = QPushButton("Folder…")
+        self.status = QLabel("Not started")
+        header.addWidget(QLabel(f"Terminal {panel_id}"))
+        header.addWidget(self.profile_box)
+        for button in (self.start_button, self.stop_button, self.restart_button, self.folder_button):
+            header.addWidget(button)
+        header.addWidget(self.status, 1)
+        layout.addLayout(header)
+
+        self.view = TerminalView(panel_id)
+        layout.addWidget(self.view, 1)
 
 
-# ------------------------------------------------------------------
-# Desktop layout manager
-# ------------------------------------------------------------------
-class DesktopLayout:
-    """Manages four corner panels, centre chat, and + Add Terminal.
-    Layout expansion is a GUI action; ConPTY resize is synchronized
-    with the renderer's cell grid via debounced notifications.
-    """
+class SupervisorChat(QFrame):
+    """Central supervisor: explicit targeting, queues, approvals and review."""
 
-    def __init__(self, parent_hwnd: int, manager: TerminalManager, cwd: Path | None = None):
-        self.parent = parent_hwnd
-        self.manager = manager
-        self.cwd = cwd or Path.home()
-        self.panels: dict[int, int] = {}
-        self.chat_hwnd = 0
-        self.add_hwnd = 0
-        self.client_rect = (0, 0, 1200, 800)  # default, updated on resize
-        self._thread_hook_registered = False
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(1000)
+        self.target_box = QComboBox()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Plain text goes to the selected terminal. /help for commands.")
+        self.send_button = QPushButton("Send")
+        self.pause_button = QPushButton("Pause")
+        self.resume_button = QPushButton("Resume")
+        self.review_button = QPushButton("Review")
+        self.stop_button = QPushButton("Stop")
+        self.restart_button = QPushButton("Restart")
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Target:"))
+        controls.addWidget(self.target_box, 1)
+        for button in (self.pause_button, self.resume_button, self.review_button,
+                       self.stop_button, self.restart_button):
+            controls.addWidget(button)
+        entry = QHBoxLayout()
+        entry.addWidget(self.input, 1)
+        entry.addWidget(self.send_button)
+        layout.addWidget(QLabel("Supervisor"))
+        layout.addWidget(self.log, 1)
+        layout.addLayout(controls)
+        layout.addLayout(entry)
 
-    def build(self) -> None:
-        """Create initial four panels + centre chat + add button."""
-        rect = win32gui.GetClientRect(self.parent)
-        self.client_rect = rect
-        # Four corners
-        corners = {
-            1: (rect[0] + MARGIN, rect[1] + MARGIN),                      # TL
-            2: (rect[2] - PANEL_W - MARGIN, rect[1] + MARGIN),            # TR
-            3: (rect[0] + MARGIN, rect[3] - PANEL_H - MARGIN),             # BL
-            4: (rect[2] - PANEL_W - MARGIN, rect[3] - PANEL_H - MARGIN),  # BR
-        }
-        for sid in (1, 2, 3, 4):
-            x, y = corners[sid]
-            hwnd = win32gui.CreateWindow(
-                WCLASS_PANEL,
-                f"Panel {sid}",
-                win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_BORDER,
-                x, y, PANEL_W, PANEL_H,
-                self.parent, 0, win32gui.GetModuleHandle(None), None,
-            )
-            win32gui.SetWindowLong(hwnd, win32con.GWL_USERDATA, sid)
-            self.panels[sid] = hwnd
-            _panel_buffers[sid] = []
-            _panel_hwnds[sid] = hwnd
-            # Subscribe panel to manager slot
-            manager = self.manager
-            slot = manager.slot(sid)
-            with slot.lock:
-                slot.subscribers.append(_PanelQueue(sid, hwnd))
 
-        # Centre chat (compact supervisor chat)
-        cx = (rect[2] - CHAT_W) // 2
-        cy = (rect[3] - CHAT_H) // 2
-        self.chat_hwnd = win32gui.CreateWindow(
-            WCLASS_CHAT,
-            "Supervisor Chat",
-            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_BORDER,
-            cx, cy, CHAT_W, CHAT_H,
-            self.parent, 0, win32gui.GetModuleHandle(None), None,
+class MainWindow(QMainWindow):
+    def __init__(self, state_path: Path | None = None, state: AppState | None = None) -> None:
+        super().__init__()
+        self.setWindowTitle("Prime Harness — Native Windows Control Room")
+        self.resize(1400, 900)
+        self.state_path = state_path or default_state_path()
+        self.state = state if state is not None else load_state(self.state_path)
+        self.supervisor = Supervisor()
+        self.supervisor.history = list(self.state.supervisor_history)
+        self.panels: dict[str, TerminalPanel] = {}
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        self.top_row = QSplitter(Qt.Orientation.Horizontal)
+        self.middle_row = QSplitter(Qt.Orientation.Horizontal)
+        self.extra_row = QSplitter(Qt.Orientation.Horizontal)
+        self.vertical = QSplitter(Qt.Orientation.Vertical)
+        self.vertical.addWidget(self.top_row)
+        self.vertical.addWidget(self.middle_row)
+        self.vertical.addWidget(self.extra_row)
+        self.extra_row.hide()
+        outer.addWidget(self.vertical, 1)
+
+        self.chat = SupervisorChat()
+        self.chat.send_button.clicked.connect(self._on_chat_submit)
+        self.chat.input.returnPressed.connect(self._on_chat_submit)
+        self.chat.target_box.currentIndexChanged.connect(self._on_target_changed)
+        self.chat.pause_button.clicked.connect(lambda: self.handle_chat("/pause"))
+        self.chat.resume_button.clicked.connect(lambda: self.handle_chat("/resume"))
+        self.chat.review_button.clicked.connect(lambda: self.handle_chat("/review"))
+        self.chat.stop_button.clicked.connect(lambda: self.handle_chat("/stop"))
+        self.chat.restart_button.clicked.connect(lambda: self.handle_chat("/restart"))
+
+        bar = QHBoxLayout()
+        self.add_button = QPushButton("+ Add Terminal")
+        self.sessions_button = QPushButton("Sessions")
+        self.notifications_button = QPushButton("Notifications")
+        self.bar_status = QLabel("")
+        bar.addWidget(self.add_button)
+        bar.addWidget(self.sessions_button)
+        bar.addWidget(self.notifications_button)
+        bar.addStretch(1)
+        bar.addWidget(self.bar_status)
+        outer.addLayout(bar)
+        self.add_button.clicked.connect(self.add_terminal)
+        self.sessions_button.clicked.connect(self._show_sessions_menu)
+        self.notifications_button.clicked.connect(self._show_notifications)
+
+        self._build_panels()
+        self.supervisor.log("Supervisor ready. " + CHAT_HELP.splitlines()[0])
+        self._refresh_targets()
+        self._refresh_chat_log()
+
+        self.pump = QTimer(self)
+        self.pump.timeout.connect(self._pump)
+        self.pump.start(PUMP_INTERVAL_MS)
+
+    # ------------------------------------------------------------ panels
+    def _build_panels(self) -> None:
+        configured = {p.panel_id: p for p in self.state.panels}
+        for index, panel_id in enumerate(FIXED_PANEL_IDS):
+            config = configured.get(panel_id) or PanelConfig(
+                panel_id, DEFAULT_PANEL_PROFILES[index], self.state.default_cwd)
+            self._create_panel(config)
+        self.top_row.addWidget(self.panels["1"])
+        self.top_row.addWidget(self.panels["2"])
+        self.middle_row.addWidget(self.panels["3"])
+        self.middle_row.addWidget(self.chat)
+        self.middle_row.addWidget(self.panels["4"])
+        for config in self.state.panels:
+            if config.panel_id not in self.panels:
+                self._create_panel(config)
+                self.extra_row.addWidget(self.panels[config.panel_id])
+                self.extra_row.show()
+        self.top_row.setSizes([1, 1])
+        self.middle_row.setSizes([1, 1, 1])
+        self._persist()
+
+    def _create_panel(self, config: PanelConfig) -> TerminalPanel:
+        panel = TerminalPanel(config.panel_id, self.state.profiles)
+        panel.cwd = config.cwd
+        index = panel.profile_box.findData(config.profile_id)
+        panel.profile_box.setCurrentIndex(max(0, index))
+        panel.start_button.clicked.connect(lambda: self.start_panel(panel.panel_id))
+        panel.stop_button.clicked.connect(lambda: self.stop_panel(panel.panel_id))
+        panel.restart_button.clicked.connect(lambda: self.restart_panel(panel.panel_id))
+        panel.folder_button.clicked.connect(lambda: self.choose_folder(panel.panel_id))
+        panel.profile_box.currentIndexChanged.connect(lambda _i: self._persist())
+        panel.view.focused_panel.connect(self._on_panel_focused)
+        panel.view.placeholder = "Press Start to launch this profile in its folder."
+        self.panels[config.panel_id] = panel
+        self.supervisor.register(config.panel_id, f"Terminal {config.panel_id}")
+        panel.status.setText("Not started")
+        return panel
+
+    def add_terminal(self) -> str:
+        numeric = [int(p) for p in self.panels if p.isdigit()]
+        panel_id = str(max(numeric, default=0) + 1)
+        panel = self._create_panel(PanelConfig(panel_id, "cmd", self.state.default_cwd))
+        self.extra_row.addWidget(panel)
+        self.extra_row.show()
+        self._refresh_targets()
+        self._persist()
+        self.supervisor.log(f"Added Terminal {panel_id} (Command Prompt). Press Start to launch.")
+        self._refresh_chat_log()
+        return panel_id
+
+    def _profile_for(self, panel: TerminalPanel) -> LaunchProfile | None:
+        return find_profile(self.state.profiles, str(panel.profile_box.currentData()))
+
+    def start_panel(self, panel_id: str) -> bool:
+        panel = self.panels[panel_id]
+        if panel.session is not None and panel.session.running:
+            return True
+        profile = self._profile_for(panel)
+        if profile is None:
+            panel.status.setText("No profile selected")
+            return False
+        argv, error = resolve_argv(profile.argv)
+        if error:
+            panel.status.setText(error)
+            self._notify(panel_id, "failed", f"{profile.name}: {error}")
+            return False
+        cwd = panel.cwd or self.state.default_cwd or str(Path.home())
+        session = PtySession(
+            session_id=f"panel-{panel_id}-{os.getpid()}-{id(panel)}",
+            argv=argv,
+            cwd=cwd,
+            env=dict(profile.env),
+            rows=panel.view.vt.rows,
+            cols=panel.view.vt.cols,
         )
+        panel.reported_exit = False
+        panel.view.vt = VtScreen(panel.view.vt.rows, panel.view.vt.cols)
+        panel.view.placeholder = ""
+        if session.start():
+            panel.session = session
+            panel.view.session = session
+            panel.status.setText(f"Running · {profile.name} · {cwd}")
+            self.supervisor.log(f"[{panel_id}] started {profile.name} in {cwd}")
+            self._refresh_chat_log()
+            return True
+        panel.status.setText(session.error or "Launch failed")
+        self._notify(panel_id, "failed", f"{profile.name} did not start: {session.error}")
+        return False
 
-        # + Add Terminal control (side / bottom-right area)
-        ax = rect[2] - 140
-        ay = rect[3] - 40
-        self.add_hwnd = win32gui.CreateWindow(
-            WCLASS_ADD,
-            "+ Add Terminal",
-            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_BORDER,
-            ax, ay, 120, 28,
-            self.parent, 0, win32gui.GetModuleHandle(None), None,
-        )
-        # Link button back to layout instance
-        _add_wndproc._app_ref = self
+    def stop_panel(self, panel_id: str) -> bool:
+        panel = self.panels[panel_id]
+        if panel.session is None:
+            return True
+        stopped = panel.session.stop()
+        if stopped:
+            panel.status.setText("Stopped by operator")
+            self.supervisor.log(f"[{panel_id}] stopped")
+        else:
+            panel.status.setText("Stop requested; process still exiting")
+        self._refresh_chat_log()
+        return stopped
 
-        if not self._thread_hook_registered:
-            self._thread_hook_registered = True
-            threading.Thread(target=self._pump_queues, daemon=True).start()
+    def restart_panel(self, panel_id: str) -> bool:
+        self.stop_panel(panel_id)
+        return self.start_panel(panel_id)
 
-    def add_terminal(self) -> int:
-        """Allocate new independent slot and trigger responsive reflow."""
-        sid = self.manager.add_slot()
-        self.manager.launch(sid)
-        # Add panel window (positioned in free workspace, here top-right area below existing)
-        rect = win32gui.GetClientRect(self.parent)
-        x = rect[2] - PANEL_W - MARGIN
-        y = rect[3] - PANEL_H - 80  # above bottom margin, new slot
-        hwnd = win32gui.CreateWindow(
-            WCLASS_PANEL,
-            f"Panel {sid}",
-            win32con.WS_CHILD | win32con.WS_VISIBLE | win32con.WS_BORDER,
-            x, y, PANEL_W, PANEL_H,
-            self.parent, 0, win32gui.GetModuleHandle(None), None,
-        )
-        win32gui.SetWindowLong(hwnd, win32con.GWL_USERDATA, sid)
-        self.panels[sid] = hwnd
-        _panel_buffers[sid] = []
-        _panel_hwnds[sid] = hwnd
-        slot = self.manager.slot(sid)
-        with slot.lock:
-            slot.subscribers.append(_PanelQueue(sid, hwnd))
-        # Reflow existing panels if needed (simplified: keep 4 fixed, 5th overlays)
-        win32gui.InvalidateRect(self.parent, None, False)
-        return sid
+    def choose_folder(self, panel_id: str) -> None:
+        panel = self.panels[panel_id]
+        chosen = QFileDialog.getExistingDirectory(self, "Working directory",
+                                                  panel.cwd or str(Path.home()))
+        if chosen:
+            panel.cwd = chosen
+            panel.status.setText(f"Folder set: {chosen} (applies on next Start)")
+            self._persist()
 
-    def _pump_queues(self) -> None:
-        while True:
-            time.sleep(0.05)
-            # Flush buffers from subscribers to windows via InvalidateRect
-            for sid, hwnd in list(self.panels.items()):
-                # Pull from subscriber (simplified: the subscriber object stores recent)
-                # In production, the queue object feeds chunks directly to buffer
-                pass
-            # Refresh all panel windows
-            for sid, hwnd in self.panels.items():
-                if win32gui.IsWindow(hwnd):
-                    # Force redraw with updated buffer from subscriber mechanism
-                    # The actual chunk accumulation is handled by _PanelQueue below
-                    try:
-                        win32gui.InvalidateRect(hwnd, None, False)
-                    except Exception:
-                        pass
+    # ----------------------------------------------------------- pump
+    def _pump(self) -> None:
+        for panel_id, panel in self.panels.items():
+            session = panel.session
+            if session is None:
+                continue
+            data = session.drain()
+            if data:
+                panel.view.feed(data)
+            if session.state is SessionState.EXITED and not panel.reported_exit:
+                panel.reported_exit = True
+                code = session.exit_code
+                if code in (0, None):
+                    kind = "completed"
+                    message = "process exited" + (f" (code {code})" if code is not None else "")
+                else:
+                    kind = "failed"
+                    message = f"process exited with code {code}"
+                panel.status.setText(f"Exited · {message}")
+                self._notify(panel_id, kind, message)
+            if session.running:
+                for command in self.supervisor.take_deliverable(panel_id):
+                    if session.write(command.text + "\r"):
+                        self.supervisor.log(f"[{panel_id}] delivered #{command.command_id}")
+                    else:
+                        command.status = "queued"
+                        break
+        self._refresh_bar()
 
-    def resize_panels(self) -> None:
-        """Debounced resize synchronization: update ConPTY rows/cols
-        with renderer cell grid without restarting processes."""
-        rect = win32gui.GetClientRect(self.parent)
-        # Simplified: resize panels proportionally
-        for sid, hwnd in self.panels.items():
-            if win32gui.IsWindow(hwnd):
-                # Reposition to maintain corners (simplified static)
-                pass
-            # Synchronize associated ConPTY dimensions
+    def _notify(self, panel_id: str, kind: str, message: str) -> None:
+        self.supervisor.notify(panel_id, kind, message)
+        self._refresh_chat_log()
+
+    def _refresh_bar(self) -> None:
+        unread = self.supervisor.unread_count()
+        self.notifications_button.setText(f"Notifications ({unread})" if unread else "Notifications")
+        running = sum(1 for p in self.panels.values() if p.session and p.session.running)
+        self.bar_status.setText(f"{running} running · {len(self.panels)} terminals")
+
+    # ------------------------------------------------------ supervisor
+    def _refresh_targets(self) -> None:
+        box = self.chat.target_box
+        box.blockSignals(True)
+        box.clear()
+        for panel_id in self.panels:
+            box.addItem(f"Terminal {panel_id}", panel_id)
+        if self.supervisor.target in self.panels:
+            box.setCurrentIndex(box.findData(self.supervisor.target))
+        box.blockSignals(False)
+
+    def _on_target_changed(self, _index: int) -> None:
+        data = self.chat.target_box.currentData()
+        if data:
+            self.supervisor.select(str(data))
+
+    def _on_panel_focused(self, panel_id: str) -> None:
+        if self.supervisor.select(panel_id):
+            self._refresh_targets()
+
+    def _on_chat_submit(self) -> None:
+        line = self.chat.input.text()
+        self.chat.input.clear()
+        if line.strip():
+            self.handle_chat(line)
+
+    def handle_chat(self, line: str) -> None:
+        """Route one supervisor line. Plain text is only ever sent to the target."""
+        action, argument = self.supervisor.parse_chat(line)
+        target = self.supervisor.target
+        ident = argument.split(" ", 1)[0] if argument else ""
+        if action == "send":
+            if not target:
+                self.supervisor.log("No target selected. Use /to <id>.")
+            else:
+                self.supervisor.enqueue(target, argument)
+        elif action == "to":
+            if self.supervisor.select(ident):
+                self._refresh_targets()
+                self.supervisor.log(f"Target: Terminal {ident}")
+            else:
+                self.supervisor.log(f"Unknown terminal '{ident}'.")
+        elif action in ("approve", "reject"):
             try:
-                # Approximate cell size 8x16; compute rows/cols
-                cols = max(20, (rect[2] - MARGIN * 2) // 8)
-                rows = max(5, (rect[3] - MARGIN * 2) // 16)
-                self.manager.resize(sid, rows, cols)
-            except Exception:
-                pass
+                command_id = int(ident)
+            except ValueError:
+                self.supervisor.log(f"Usage: /{action} <cmd#>")
+            else:
+                decide = self.supervisor.approve if action == "approve" else self.supervisor.reject
+                if not decide(command_id):
+                    self.supervisor.log(f"#{ident} is not awaiting approval.")
+        elif action == "queue":
+            pending = self.supervisor.queue_for(target) if target else []
+            listing = ", ".join(f"#{c.command_id} {c.status}" for c in pending) or "empty"
+            self.supervisor.log(f"Queue for Terminal {target}: {listing}")
+        elif action == "review":
+            panel_id = ident or target or ""
+            if panel_id in self.panels:
+                text = self.panels[panel_id].view.vt.plain_text(60) or "(no output yet)"
+                self.supervisor.log(f"--- Review Terminal {panel_id} (last 60 lines) ---\n{text}\n---")
+        elif action in ("pause", "resume"):
+            panel_id = ident or target or ""
+            if panel_id in self.panels:
+                self.supervisor.set_paused(panel_id, action == "pause")
+                note = ("Delivery of queued commands paused; the agent process keeps running."
+                        if action == "pause" else "Delivery resumed.")
+                self.supervisor.log(f"[{panel_id}] {note}")
+        elif action in ("stop", "restart"):
+            panel_id = ident or target or ""
+            if panel_id in self.panels:
+                if action == "stop":
+                    self.stop_panel(panel_id)
+                else:
+                    self.restart_panel(panel_id)
+        elif action == "status":
+            for panel_id, panel in self.panels.items():
+                state = panel.session.state.value if panel.session else "not started"
+                paused = " (paused)" if self.supervisor.sessions[panel_id].paused else ""
+                self.supervisor.log(f"Terminal {panel_id}: {state}{paused} · "
+                                    f"{panel.profile_box.currentText()}")
+        elif action == "help":
+            self.supervisor.log(CHAT_HELP)
+        else:
+            self.supervisor.log(f"Unknown command /{action}. Try /help.")
+        self._refresh_chat_log()
+        self._persist()
 
+    def _refresh_chat_log(self) -> None:
+        bar = self.chat.log.verticalScrollBar()
+        self.chat.log.setPlainText("\n".join(self.supervisor.history[-400:]))
+        bar.setValue(bar.maximum())
+        self._refresh_bar()
 
-class _PanelQueue:
-    """Per-panel subscriber that collects chunk strings and buffers them
-    for native window display. Keeps ConPTY stream lossless; chunks
-    are stored ordered and drawn on WM_PAINT.
-    """
+    def _show_sessions_menu(self) -> None:
+        menu = QMenu(self)
+        for panel_id, panel in self.panels.items():
+            state = panel.session.state.value if panel.session else "not started"
+            action = menu.addAction(f"Terminal {panel_id} · {panel.profile_box.currentText()} · {state}")
+            action.triggered.connect(lambda _checked=False, pid=panel_id: self._select_from_menu(pid))
+        menu.exec(self.sessions_button.mapToGlobal(self.sessions_button.rect().bottomLeft()))
 
-    def __init__(self, sid: int, hwnd: int):
-        self.sid = sid
-        self.hwnd = hwnd
-        self.buffer: list[str] = []
-        self._max = 300
+    def _select_from_menu(self, panel_id: str) -> None:
+        self.supervisor.select(panel_id)
+        self._refresh_targets()
+        self.panels[panel_id].view.setFocus()
 
-    def put_nowait(self, chunk: str) -> None:
-        self.buffer.append(chunk)
-        if len(self.buffer) > self._max:
-            self.buffer = self.buffer[-self._max:]
-        # Sync to global buffer reference (always point to current buffer)
-        _panel_buffers[self.sid] = self.buffer
-        # Trigger repaint on native window
+    def _show_notifications(self) -> None:
+        items = self.supervisor.notifications[-50:]
+        text = "\n".join(f"[{n.created_at}] Terminal {n.session_id}: {n.kind} — {n.message}"
+                         for n in items) or "No notifications."
+        self.supervisor.mark_all_read()
+        self._refresh_bar()
+        QMessageBox.information(self, "Notifications", text)
+
+    # ----------------------------------------------------- persistence
+    def _persist(self) -> None:
+        self.state.panels = [
+            PanelConfig(panel_id, str(panel.profile_box.currentData()), panel.cwd)
+            for panel_id, panel in self.panels.items()
+        ]
+        self.state.supervisor_history = self.supervisor.history[-500:]
         try:
-            if win32gui.IsWindow(self.hwnd):
-                win32gui.InvalidateRect(self.hwnd, None, False)
-        except Exception:
-            pass
+            save_state(self.state_path, self.state)
+        except OSError as exc:
+            self.supervisor.log(f"Could not save settings: {exc}")
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.pump.stop()
+        for panel in self.panels.values():
+            if panel.session is not None:
+                panel.session.stop()
+        self._persist()
+        super().closeEvent(event)
 
 
-# ------------------------------------------------------------------
-# Main window procedure for the native desktop shell
-# ------------------------------------------------------------------
-_main_hwnd = 0
-
-
-def _main_wndproc(hwnd, msg, wparam, lparam):
-    if msg == win32con.WM_SIZE:
-        # Resize triggers layout reflow and debounced ConPTY resize
-        if _main_hwnd == hwnd and hasattr(_main_wndproc, "_layout"):
-            layout = _main_wndproc._layout
-            if layout:
-                layout.resize_panels()
-                # Reposition chat/add button roughly centered/bottom-right
-                rect = win32gui.GetClientRect(hwnd)
-                # Simplified: keep fixed positions relative to new size
-                # In full implementation, layout math recalculates all rects
-        return 0
-    elif msg == win32con.WM_DESTROY:
-        win32gui.PostQuitMessage(0)
-        return 0
-    return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
-
-
-def build_main_window(manager: TerminalManager, cwd: Path | None = None) -> int:
-    _register_classes()
-    wc = win32gui.WNDCLASS()
-    wc.hInstance = win32gui.GetModuleHandle(None)
-    wc.lpszClassName = "PrimeHarnessMain"
-    wc.lpfnWndProc = _main_wndproc
-    wc.hbrBackground = win32con.COLOR_WINDOW
-    wc.style = win32con.CS_DBLCLKS | win32con.CS_HREDRAW | win32con.CS_VREDRAW
-    win32gui.RegisterClass(wc)
-
-    hwnd = win32gui.CreateWindow(
-        "PrimeHarnessMain",
-        "Prime Harness — Native Windows Control Room",
-        win32con.WS_OVERLAPPEDWINDOW | win32con.WS_VISIBLE,
-        win32con.CW_USEDEFAULT, win32con.CW_USEDEFAULT,
-        1280, 900,
-        0, 0, win32gui.GetModuleHandle(None), None,
-    )
-    layout = DesktopLayout(hwnd, manager, cwd=cwd)
-    layout.build()
-    _main_wndproc._layout = layout
-    return hwnd
-
-
-def main() -> None:
-    # Initialize manager with four independent slots (default from spec)
-    manager = TerminalManager(count=4)
-    for sid in range(1, 5):
-        manager.launch(sid)
-        manager.rotate_token(sid)
-    # Verify embeddable renderer before claiming compatibility
-    from prime_harness.native_renderer_verify import RendererVerifier
-    ver = RendererVerifier()
-    results = ver.run_all()
-    # Print verification results to console (not to external installations)
-    for k, v in results.items():
-        print(f"[VERIFY] {k}: {v}")
-    # Launch native desktop shell
-    hwnd = build_main_window(manager)
-    # Message loop (native Windows message pump)
-    while True:
-        msg = win32gui.PeekMessage(None, 0, 0, win32con.PM_REMOVE)
-        if msg is None or (isinstance(msg, (list, tuple)) and len(msg) == 0):
-            time.sleep(0.01)
-            continue
-        # msg format: (message, (hWnd, wParam, lParam, time, pt))
-        if msg[0] == win32con.WM_QUIT:
-            break
-        win32gui.TranslateMessage(msg)
-        win32gui.DispatchMessage(msg)
+def main() -> int:
+    app = QApplication.instance() or QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
