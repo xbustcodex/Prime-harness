@@ -40,6 +40,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from prime_harness.control_room import ControlRoom
+from prime_harness.mcp_api import ApiServer, api_settings
 from prime_harness.persistence import (
     AppState,
     PanelConfig,
@@ -162,6 +164,9 @@ class TerminalView(QWidget):
         self.cell_h = max(1, metrics.height())
         self._ascent = metrics.ascent()
         self._button_down = False
+        # Mouse-drag selection (used when the application has not enabled mouse tracking).
+        self._selection: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._selecting = False
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(self.cell_w * MIN_GRID_COLS, self.cell_h * MIN_GRID_ROWS)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -230,6 +235,17 @@ class TerminalView(QWidget):
                 if cell.underscore:
                     painter.setPen(fg)
                     painter.drawLine(x, y + ch - 1, x + cw - 1, y + ch - 1)
+        range_ = self._normalize_selection()
+        if range_ is not None:
+            (sel_r1, sel_c1), (sel_r2, sel_c2) = range_
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 50))
+            for sel_row in range(sel_r1, min(sel_r2 + 1, self.vt.rows)):
+                start = sel_c1 if sel_row == sel_r1 else 0
+                end = (sel_c2 + 1) if sel_row == sel_r2 else self.vt.cols
+                painter.drawRect(start * cw, sel_row * ch, (end - start) * cw, ch)
+            painter.restore()
         cursor_row, cursor_col, cursor_visible = self.vt.cursor
         if cursor_visible and self.hasFocus():
             painter.fillRect(cursor_col * cw, cursor_row * ch, cw, ch, QColor(200, 200, 200, 110))
@@ -261,6 +277,43 @@ class TerminalView(QWidget):
     def copy_visible(self) -> None:
         QApplication.clipboard().setText(self.vt.plain_text(self.vt.rows))
 
+    # ---------------------------------------------------------- selection
+    def _normalize_selection(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """Selection as ((start_row, start_col), (end_row, end_col)), start <= end."""
+        if self._selection is None:
+            return None
+        (r1, c1), (r2, c2) = self._selection
+        return ((r2, c2), (r1, c1)) if (r2, c2) < (r1, c1) else ((r1, c1), (r2, c2))
+
+    def selected_text(self) -> str:
+        """Text inside the current selection, rows joined, trailing blanks trimmed."""
+        range_ = self._normalize_selection()
+        if range_ is None:
+            return ""
+        (r1, c1), (r2, c2) = range_
+        rows = self.vt.render_rows()
+        lines: list[str] = []
+        for row_index in range(r1, min(r2 + 1, len(rows))):
+            start = c1 if row_index == r1 else 0
+            end = (c2 + 1) if row_index == r2 else self.vt.cols  # end column inclusive
+            lines.append("".join(cell.data for cell in rows[row_index][start:end]).rstrip())
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines)
+
+    def clear_selection(self) -> None:
+        if self._selection is not None:
+            self._selection = None
+            self.update()
+
+    def copy_selection(self) -> bool:
+        """Copy the selection to the clipboard. False when there is no selection."""
+        text = self.selected_text()
+        if not text:
+            return False
+        QApplication.clipboard().setText(text)
+        return True
+
     def keyPressEvent(self, event) -> None:  # noqa: N802
         modifiers = event.modifiers()
         ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
@@ -273,8 +326,16 @@ class TerminalView(QWidget):
         if ctrl and shift and key == int(Qt.Key.Key_C):
             self.copy_visible()
             return
+        if ctrl and not shift and key == int(Qt.Key.Key_C) and self.selected_text():
+            # With an active selection, Ctrl+C copies instead of sending SIGINT.
+            self.copy_selection()
+            self.clear_selection()
+            return
         if shift and key == int(Qt.Key.Key_Insert):
             self.paste_from_clipboard()
+            return
+        if key == int(Qt.Key.Key_Escape) and self._selection is not None:
+            self.clear_selection()
             return
         name = _KEY_NAMES.get(key)
         if name is not None:
@@ -282,10 +343,12 @@ class TerminalView(QWidget):
                 name, app_cursor=self.vt.app_cursor, shift=shift, alt=alt, ctrl=ctrl
             )
             if sequence is not None:
+                self.clear_selection()
                 self.send(sequence)
             return
         text = event.text()
         if text:
+            self.clear_selection()
             self.send(encode_text(text, alt=alt))
 
     # ------------------------------------------------------------ mouse
@@ -297,12 +360,24 @@ class TerminalView(QWidget):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         self.setFocus(Qt.FocusReason.MouseFocusReason)
         button = _MOUSE_BUTTONS.get(event.button())
+        if button == 0 and not self.vt.mouse_level:
+            col, row = self._cell_at(event.position())
+            self._selection = ((row, col), (row, col))
+            self._selecting = True
+            self.update()
+            return
         if button is not None and self.vt.mouse_level:
             col, row = self._cell_at(event.position())
             self.send(encode_mouse(button, col, row, press=True, sgr=self.vt.mouse_sgr))
             self._button_down = True
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._selecting and event.button() == Qt.MouseButton.LeftButton:
+            self._selecting = False
+            if self._selection is not None and self._selection[0] == self._selection[1]:
+                self._selection = None  # plain click, not a drag
+            self.update()
+            return
         button = _MOUSE_BUTTONS.get(event.button())
         if button is not None and self.vt.mouse_level and self._button_down:
             col, row = self._cell_at(event.position())
@@ -310,6 +385,12 @@ class TerminalView(QWidget):
         self._button_down = False
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._selecting and self._selection is not None:
+            anchor = self._selection[0]
+            col, row = self._cell_at(event.position())
+            self._selection = (anchor, (row, col))
+            self.update()
+            return
         level = self.vt.mouse_level
         if level == 1003 or (level == 1002 and self._button_down):
             col, row = self._cell_at(event.position())
@@ -434,6 +515,10 @@ class MainWindow(QMainWindow):
         self.supervisor = Supervisor()
         self.supervisor.history = list(self.state.supervisor_history)
         self.panels: dict[str, TerminalPanel] = {}
+        # External-chat connectivity: pairing, per-terminal bridges, event cursors.
+        _host, _port, public = api_settings()
+        self.room = ControlRoom(self.supervisor, public_base=public)
+        self.api_server: ApiServer | None = None
 
         # The whole interface lives in a scroll area: on screens smaller than the
         # layout minimum every panel stays reachable instead of being clipped.
@@ -538,6 +623,7 @@ class MainWindow(QMainWindow):
         panel.view.placeholder = "Press Start to launch this profile in its folder."
         self.panels[config.panel_id] = panel
         self.supervisor.register(config.panel_id, f"Terminal {config.panel_id}")
+        self.room.register_terminal(config.panel_id)
         panel.status.setText("Not started")
         return panel
 
@@ -585,10 +671,13 @@ class MainWindow(QMainWindow):
             panel.session = session
             panel.view.session = session
             panel.status.setText(f"Running · {profile.name} · {cwd}")
+            self.room.set_status(panel_id, f"running · {profile.name}")
+            self.room.publish("session_started", panel_id, f"{profile.name} started in {cwd}")
             self.supervisor.log(f"[{panel_id}] started {profile.name} in {cwd}")
             self._refresh_chat_log()
             return True
         panel.status.setText(session.error or "Launch failed")
+        self.room.set_status(panel_id, "failed to start")
         self._notify(panel_id, "failed", f"{profile.name} did not start: {session.error}")
         return False
 
@@ -599,6 +688,8 @@ class MainWindow(QMainWindow):
         stopped = panel.session.stop()
         if stopped:
             panel.status.setText("Stopped by operator")
+            self.room.set_status(panel_id, "stopped by operator")
+            self.room.publish("session_stopped", panel_id, "stopped by operator")
             self.supervisor.log(f"[{panel_id}] stopped")
         else:
             panel.status.setText("Stop requested; process still exiting")
@@ -628,6 +719,7 @@ class MainWindow(QMainWindow):
             data = session.drain()
             if data:
                 panel.view.feed(data)
+                self.room.publish_output(panel_id, panel.view.vt.plain_text(60))
             if session.state is SessionState.EXITED and not panel.reported_exit:
                 panel.reported_exit = True
                 code = session.exit_code
@@ -638,11 +730,13 @@ class MainWindow(QMainWindow):
                     kind = "failed"
                     message = f"process exited with code {code}"
                 panel.status.setText(f"Exited · {message}")
+                self.room.set_status(panel_id, f"exited ({code})")
                 self._notify(panel_id, kind, message)
             if session.running:
                 for command in self.supervisor.take_deliverable(panel_id):
                     if session.write(command.text + "\r"):
                         self.supervisor.log(f"[{panel_id}] delivered #{command.command_id}")
+                        self.room.note_delivered(panel_id, command)
                     else:
                         command.status = "queued"
                         break
@@ -650,6 +744,7 @@ class MainWindow(QMainWindow):
 
     def _notify(self, panel_id: str, kind: str, message: str) -> None:
         self.supervisor.notify(panel_id, kind, message)
+        self.room.publish("notification", panel_id, f"{kind}: {message}")
         self._refresh_chat_log()
 
     def _refresh_bar(self) -> None:
@@ -746,12 +841,66 @@ class MainWindow(QMainWindow):
                 self.supervisor.log(
                     f"Terminal {panel_id}: {state}{paused} · {panel.profile_box.currentText()}"
                 )
+        elif action == "pair":
+            panel_id = ident or target or ""
+            if panel_id not in self.panels:
+                self.supervisor.log("Usage: /pair <id> (or select a target first)")
+            else:
+                token, url = self.room.pairings.pair(panel_id, label=f"terminal-{panel_id}")
+                self.supervisor.log(f"[{panel_id}] pairing link (token shown once):\n{url}")
+                self.room.publish("paired", panel_id, "pairing link issued")
+        elif action == "revoke":
+            if ident == "all":
+                count = self.room.pairings.revoke_all()
+                self.supervisor.log(f"Revoked {count} pairing token(s).")
+                self.room.publish("revoked", None, f"all pairings revoked ({count})")
+            else:
+                count = self.room.pairings.revoke_terminal(ident)
+                self.supervisor.log(f"Revoked {count} pairing token(s) for Terminal {ident}.")
+                if ident in self.panels:
+                    self.room.publish("revoked", ident, f"{count} pairing token(s) revoked")
+        elif action == "api":
+            sub = ident.lower() if ident else "status"
+            if sub == "start":
+                self._start_api()
+            elif sub == "stop":
+                self._stop_api()
+            else:
+                if self.api_server is not None and self.api_server.running:
+                    self.supervisor.log(
+                        f"API running on {self.api_server.host}:{self.api_server.port}"
+                    )
+                else:
+                    self.supervisor.log("API not running. Use /api start.")
         elif action == "help":
             self.supervisor.log(CHAT_HELP)
         else:
             self.supervisor.log(f"Unknown command /{action}. Try /help.")
         self._refresh_chat_log()
         self._persist()
+
+    def _start_api(self) -> None:
+        """Start the authenticated control API (pairing links, MCP, remote access)."""
+        if self.api_server is not None and self.api_server.running:
+            self.supervisor.log(
+                f"API already running on {self.api_server.host}:{self.api_server.port}"
+            )
+            return
+        host, port, public = api_settings()
+        self.room.pairings.public_base = public.rstrip("/")
+        self.api_server = ApiServer(self.room, host, port)
+        if self.api_server.start():
+            self.supervisor.log(f"Control API listening on {host}:{port} · pair links use {public}")
+        else:
+            self.supervisor.log("Control API failed to start.")
+
+    def _stop_api(self) -> None:
+        if self.api_server is None:
+            self.supervisor.log("API is not running.")
+            return
+        stopped = self.api_server.stop()
+        self.api_server = None
+        self.supervisor.log("Control API stopped." if stopped else "API stop requested.")
 
     def _refresh_chat_log(self) -> None:
         bar = self.chat.log.verticalScrollBar()
@@ -944,6 +1093,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.pump.stop()
+        if self.api_server is not None:
+            self.api_server.stop()
+            self.api_server = None
         for panel in self.panels.values():
             if panel.session is not None:
                 panel.session.stop()
@@ -955,6 +1107,8 @@ def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    if os.environ.get("PRIME_HARNESS_API_AUTOSTART", "").lower() in {"1", "true", "yes"}:
+        window._start_api()
     return app.exec()
 
 

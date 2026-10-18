@@ -47,6 +47,7 @@ def main() -> int:
         "--windowed",
         f"--paths={PROJECT / 'src'}",
         "--hidden-import=winpty",
+        "--hidden-import=uvicorn",
         str(ENTRY),
     ]
     print("Running:", " ".join(cmd))

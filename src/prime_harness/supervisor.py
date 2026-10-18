@@ -7,12 +7,17 @@ commands wait for explicit approval before delivery.
 Pause/resume controls only the delivery of queued commands from this
 application to the agent. It does not suspend the agent process; the
 supervisor never claims otherwise.
+
+All public methods are guarded by a re-entrant lock: the desktop UI thread and
+external API worker threads (pairing, MCP tools, remote commands) share one
+Supervisor instance.
 """
 
 from __future__ import annotations
 
 import itertools
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -59,101 +64,119 @@ class Supervisor:
         self.history: list[str] = []
         self.target: str | None = None
         self._ids = itertools.count(1)
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------ sessions
     def register(self, session_id: str, label: str) -> None:
-        self.sessions[session_id] = SessionRecord(session_id, label)
-        if self.target is None:
-            self.target = session_id
+        with self._lock:
+            self.sessions[session_id] = SessionRecord(session_id, label)
+            if self.target is None:
+                self.target = session_id
 
     def unregister(self, session_id: str) -> None:
-        self.sessions.pop(session_id, None)
-        if self.target == session_id:
-            self.target = next(iter(self.sessions), None)
+        with self._lock:
+            self.sessions.pop(session_id, None)
+            if self.target == session_id:
+                self.target = next(iter(self.sessions), None)
 
     def select(self, session_id: str) -> bool:
-        if session_id not in self.sessions:
-            return False
-        self.target = session_id
-        return True
+        with self._lock:
+            if session_id not in self.sessions:
+                return False
+            self.target = session_id
+            return True
 
     def set_paused(self, session_id: str, paused: bool) -> None:
-        self.sessions[session_id].paused = paused
+        with self._lock:
+            self.sessions[session_id].paused = paused
 
     # ------------------------------------------------------------- commands
     def enqueue(self, session_id: str, text: str) -> QueuedCommand:
-        if session_id not in self.sessions:
-            raise KeyError(f"Unknown session {session_id}")
-        consequential = bool(CONSEQUENTIAL_PATTERN.search(text))
-        command = QueuedCommand(
-            command_id=next(self._ids),
-            session_id=session_id,
-            text=text,
-            consequential=consequential,
-            status="awaiting approval" if consequential else "queued",
-        )
-        self.commands.append(command)
-        self.log(f"[{session_id}] queued #{command.command_id}: {text}")
-        if consequential:
-            self.log(f"#{command.command_id} needs approval (/approve {command.command_id})")
-        return command
+        with self._lock:
+            if session_id not in self.sessions:
+                raise KeyError(f"Unknown session {session_id}")
+            consequential = bool(CONSEQUENTIAL_PATTERN.search(text))
+            command = QueuedCommand(
+                command_id=next(self._ids),
+                session_id=session_id,
+                text=text,
+                consequential=consequential,
+                status="awaiting approval" if consequential else "queued",
+            )
+            self.commands.append(command)
+            self.log(f"[{session_id}] queued #{command.command_id}: {text}")
+            if consequential:
+                self.log(f"#{command.command_id} needs approval (/approve {command.command_id})")
+            return command
 
     def find(self, command_id: int) -> QueuedCommand | None:
-        return next((c for c in self.commands if c.command_id == command_id), None)
+        with self._lock:
+            return next((c for c in self.commands if c.command_id == command_id), None)
 
     def approve(self, command_id: int) -> bool:
-        command = self.find(command_id)
-        if command is None or command.status != "awaiting approval":
-            return False
-        command.status = "queued"
-        self.log(f"#{command_id} approved")
-        return True
+        with self._lock:
+            command = self.find(command_id)
+            if command is None or command.status != "awaiting approval":
+                return False
+            command.status = "queued"
+            self.log(f"#{command_id} approved")
+            return True
 
     def reject(self, command_id: int) -> bool:
-        command = self.find(command_id)
-        if command is None or command.status != "awaiting approval":
-            return False
-        command.status = "rejected"
-        self.log(f"#{command_id} rejected")
-        return True
+        with self._lock:
+            command = self.find(command_id)
+            if command is None or command.status != "awaiting approval":
+                return False
+            command.status = "rejected"
+            self.log(f"#{command_id} rejected")
+            return True
 
     def pending_approvals(self) -> list[QueuedCommand]:
-        return [c for c in self.commands if c.status == "awaiting approval"]
+        with self._lock:
+            return [c for c in self.commands if c.status == "awaiting approval"]
 
     def take_deliverable(self, session_id: str) -> list[QueuedCommand]:
         """Approved commands for one session, in order. Empty while paused."""
-        record = self.sessions.get(session_id)
-        if record is None or record.paused:
-            return []
-        ready = [c for c in self.commands if c.session_id == session_id and c.status == "queued"]
-        for command in ready:
-            command.status = "sent"
-        return ready
+        with self._lock:
+            record = self.sessions.get(session_id)
+            if record is None or record.paused:
+                return []
+            ready = [
+                c for c in self.commands if c.session_id == session_id and c.status == "queued"
+            ]
+            for command in ready:
+                command.status = "sent"
+            return ready
 
     def queue_for(self, session_id: str) -> list[QueuedCommand]:
-        return [
-            c
-            for c in self.commands
-            if c.session_id == session_id and c.status in {"awaiting approval", "queued"}
-        ]
+        with self._lock:
+            return [
+                c
+                for c in self.commands
+                if c.session_id == session_id and c.status in {"awaiting approval", "queued"}
+            ]
 
     # --------------------------------------------------------- notifications
     def notify(self, session_id: str, kind: str, message: str) -> None:
-        self.notifications.append(Notification(session_id, kind, message))
-        self.log(f"[{session_id}] {kind}: {message}")
+        with self._lock:
+            self.notifications.append(Notification(session_id, kind, message))
+            self.log(f"[{session_id}] {kind}: {message}")
 
     def unread_count(self) -> int:
-        return sum(1 for n in self.notifications if not n.read)
+        with self._lock:
+            return sum(1 for n in self.notifications if not n.read)
 
     def mark_all_read(self) -> None:
-        for notification in self.notifications:
-            notification.read = True
+        with self._lock:
+            for notification in self.notifications:
+                notification.read = True
 
     # ---------------------------------------------------------------- chat
     def log(self, line: str) -> None:
-        self.history.append(line)
-        if len(self.history) > self.HISTORY_LIMIT:
-            del self.history[: len(self.history) - self.HISTORY_LIMIT]
+        with self._lock:
+            self.history.append(line)
+            if len(self.history) > self.HISTORY_LIMIT:
+                del self.history[: len(self.history) - self.HISTORY_LIMIT]
 
     def parse_chat(self, line: str) -> tuple[str, str]:
         """Interpret one chat line. Returns (action, argument)."""
@@ -167,6 +190,7 @@ class Supervisor:
 CHAT_HELP = (
     "Commands: /to <id> (select target) · /send <text> · /approve <cmd#> · /reject <cmd#>\n"
     "/queue · /review [id] · /pause [id] · /resume [id] · /stop [id] · /restart [id] · /status\n"
+    "/pair [id] · /revoke <id|all> · /api start|stop|status\n"
     "Plain text goes to the selected target only. Pause stops delivery of queued commands;\n"
     "it does not suspend the agent process."
 )
