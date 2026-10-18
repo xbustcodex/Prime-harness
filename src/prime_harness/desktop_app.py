@@ -18,8 +18,8 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -33,6 +33,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -47,10 +49,30 @@ from prime_harness.persistence import (
 )
 from prime_harness.profiles import LaunchProfile, find_profile, resolve_argv
 from prime_harness.pty_session import PtySession, SessionState
+from prime_harness.responsive_layout import (
+    clamp_window_rect,
+    fractions_from_sizes,
+    initial_window_rect,
+    sizes_from_fractions,
+)
 from prime_harness.supervisor import CHAT_HELP, Supervisor
 from prime_harness.vt_engine import VtScreen, encode_key, encode_mouse, encode_paste, encode_text
 
 PUMP_INTERVAL_MS = 30
+# Smallest character grid that still shows an agent UI legibly.
+MIN_GRID_COLS = 20
+MIN_GRID_ROWS = 8
+# Settle time before a drag-resize is applied to the ConPTY.
+GRID_DEBOUNCE_MS = 60
+# Typical window-frame margins (left, top, right, bottom); used until the window is shown.
+FRAME_ESTIMATE = (8, 31, 8, 8)
+# Default pane proportions for each splitter, used when no layout was saved.
+DEFAULT_SPLITTER_FRACTIONS: dict[str, list[float]] = {
+    "vertical": [0.5, 0.5, 0.0],
+    "top": [0.5, 0.5],
+    "middle": [1 / 3, 1 / 3, 1 / 3],
+}
+SPLITTER_NAMES = ("vertical", "top", "middle", "extra")
 DEFAULT_PANEL_PROFILES = ("omp", "primepi", "powershell", "cmd")
 FIXED_PANEL_IDS = ("1", "2", "3", "4")
 
@@ -141,14 +163,22 @@ class TerminalView(QWidget):
         self._ascent = metrics.ascent()
         self._button_down = False
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMinimumSize(self.cell_w * 20, self.cell_h * 5)
+        self.setMinimumSize(self.cell_w * MIN_GRID_COLS, self.cell_h * MIN_GRID_ROWS)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        # Drag-resizing fires many resize events; the ConPTY is resized once it settles.
+        self._grid_timer = QTimer(self)
+        self._grid_timer.setSingleShot(True)
+        self._grid_timer.setInterval(GRID_DEBOUNCE_MS)
+        self._grid_timer.timeout.connect(self.sync_grid)
 
     # ------------------------------------------------------------- grid
     def sync_grid(self) -> None:
-        """Rows and columns come from the rendered character grid, not pixels."""
-        cols = max(20, self.width() // self.cell_w)
-        rows = max(5, self.height() // self.cell_h)
+        """Rows and columns come from the rendered character grid, not pixels.
+
+        Updates the VT grid and calls the real ConPTY resize when the count changes.
+        """
+        cols = max(MIN_GRID_COLS, self.width() // self.cell_w)
+        rows = max(MIN_GRID_ROWS, self.height() // self.cell_h)
         if (rows, cols) == (self.vt.rows, self.vt.cols):
             return
         self.vt.resize(rows, cols)
@@ -156,9 +186,14 @@ class TerminalView(QWidget):
             self.session.resize(rows, cols)
         self.update()
 
+    def flush_grid(self) -> None:
+        """Apply a pending grid change immediately (used at settle points and in tests)."""
+        self._grid_timer.stop()
+        self.sync_grid()
+
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().resizeEvent(event)
-        self.sync_grid()
+        self._grid_timer.start()
 
     # ------------------------------------------------------------ paint
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -195,9 +230,9 @@ class TerminalView(QWidget):
                 if cell.underscore:
                     painter.setPen(fg)
                     painter.drawLine(x, y + ch - 1, x + cw - 1, y + ch - 1)
-        row, col, cursor_visible = self.vt.cursor
+        cursor_row, cursor_col, cursor_visible = self.vt.cursor
         if cursor_visible and self.hasFocus():
-            painter.fillRect(col * cw, row * ch, cw, ch, QColor(200, 200, 200, 110))
+            painter.fillRect(cursor_col * cw, cursor_row * ch, cw, ch, QColor(200, 200, 200, 110))
         painter.setPen(QColor("#3b8eea") if self.hasFocus() else QColor("#333333"))
         painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
         painter.end()
@@ -313,7 +348,8 @@ class TerminalPanel(QFrame):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        header = QHBoxLayout()
+        # Two header rows so the panel stays usable at narrow widths on small screens.
+        title_line = QHBoxLayout()
         self.profile_box = QComboBox()
         for profile in profiles:
             self.profile_box.addItem(profile.name, profile.profile_id)
@@ -322,17 +358,22 @@ class TerminalPanel(QFrame):
         self.restart_button = QPushButton("Restart")
         self.folder_button = QPushButton("Folder…")
         self.status = QLabel("Not started")
-        header.addWidget(QLabel(f"Terminal {panel_id}"))
-        header.addWidget(self.profile_box)
+        self.status.setMinimumWidth(0)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        title_line.addWidget(QLabel(f"Terminal {panel_id}"))
+        title_line.addWidget(self.profile_box)
+        title_line.addWidget(self.status, 1)
+        layout.addLayout(title_line)
+        button_line = QHBoxLayout()
         for button in (
             self.start_button,
             self.stop_button,
             self.restart_button,
             self.folder_button,
         ):
-            header.addWidget(button)
-        header.addWidget(self.status, 1)
-        layout.addLayout(header)
+            button_line.addWidget(button)
+        button_line.addStretch(1)
+        layout.addLayout(button_line)
 
         self.view = TerminalView(panel_id)
         layout.addWidget(self.view, 1)
@@ -360,23 +401,27 @@ class SupervisorChat(QFrame):
         self.review_button = QPushButton("Review")
         self.stop_button = QPushButton("Stop")
         self.restart_button = QPushButton("Restart")
+        self.target_box.setMinimumContentsLength(8)
+        self.target_box.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        # Controls wrap to two rows so the supervisor stays usable on narrow screens.
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Target:"))
         controls.addWidget(self.target_box, 1)
-        for button in (
-            self.pause_button,
-            self.resume_button,
-            self.review_button,
-            self.stop_button,
-            self.restart_button,
-        ):
-            controls.addWidget(button)
+        controls.addWidget(self.pause_button)
+        controls.addWidget(self.resume_button)
+        actions = QHBoxLayout()
+        for button in (self.review_button, self.stop_button, self.restart_button):
+            actions.addWidget(button)
+        actions.addStretch(1)
         entry = QHBoxLayout()
         entry.addWidget(self.input, 1)
         entry.addWidget(self.send_button)
         layout.addWidget(QLabel("Supervisor"))
         layout.addWidget(self.log, 1)
         layout.addLayout(controls)
+        layout.addLayout(actions)
         layout.addLayout(entry)
 
 
@@ -384,15 +429,21 @@ class MainWindow(QMainWindow):
     def __init__(self, state_path: Path | None = None, state: AppState | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Prime Harness — Native Windows Control Room")
-        self.resize(1400, 900)
         self.state_path = state_path or default_state_path()
         self.state = state if state is not None else load_state(self.state_path)
         self.supervisor = Supervisor()
         self.supervisor.history = list(self.state.supervisor_history)
         self.panels: dict[str, TerminalPanel] = {}
 
+        # The whole interface lives in a scroll area: on screens smaller than the
+        # layout minimum every panel stays reachable instead of being clipped.
         root = QWidget()
-        self.setCentralWidget(root)
+        self._root = root
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(root)
+        self.setCentralWidget(scroll)
         outer = QVBoxLayout(root)
         self.top_row = QSplitter(Qt.Orientation.Horizontal)
         self.middle_row = QSplitter(Qt.Orientation.Horizontal)
@@ -403,6 +454,20 @@ class MainWindow(QMainWindow):
         self.vertical.addWidget(self.extra_row)
         self.extra_row.hide()
         outer.addWidget(self.vertical, 1)
+        self._splitters = {
+            "vertical": self.vertical,
+            "top": self.top_row,
+            "middle": self.middle_row,
+            "extra": self.extra_row,
+        }
+        self._layout_applied = False
+        self._layout_ready = False
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(400)
+        self._save_timer.timeout.connect(self._persist)
+        for splitter in self._splitters.values():
+            splitter.splitterMoved.connect(lambda *_args: self._save_timer.start())
 
         self.chat = SupervisorChat()
         self.chat.send_button.clicked.connect(self._on_chat_submit)
@@ -437,6 +502,7 @@ class MainWindow(QMainWindow):
         self.pump = QTimer(self)
         self.pump.timeout.connect(self._pump)
         self.pump.start(PUMP_INTERVAL_MS)
+        self._apply_startup_geometry()
 
     # ------------------------------------------------------------ panels
     def _build_panels(self) -> None:
@@ -456,8 +522,6 @@ class MainWindow(QMainWindow):
                 self._create_panel(config)
                 self.extra_row.addWidget(self.panels[config.panel_id])
                 self.extra_row.show()
-        self.top_row.setSizes([1, 1])
-        self.middle_row.setSizes([1, 1, 1])
         self._persist()
 
     def _create_panel(self, config: PanelConfig) -> TerminalPanel:
@@ -482,7 +546,7 @@ class MainWindow(QMainWindow):
         panel_id = str(max(numeric, default=0) + 1)
         panel = self._create_panel(PanelConfig(panel_id, "cmd", self.state.default_cwd))
         self.extra_row.addWidget(panel)
-        self.extra_row.show()
+        self._show_extra_row()
         self._refresh_targets()
         self._persist()
         self.supervisor.log(f"Added Terminal {panel_id} (Command Prompt). Press Start to launch.")
@@ -725,7 +789,149 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Notifications", text)
 
     # ----------------------------------------------------- persistence
+    # ---------------------------------------------------------- geometry
+    def _screen_available(self, point: QPoint | None = None) -> QRect:
+        """Usable screen area (taskbar excluded, logical pixels) under ``point``."""
+        screen = QGuiApplication.screenAt(point) if point is not None else None
+        screen = screen or QGuiApplication.primaryScreen()
+        return screen.availableGeometry()
+
+    def _frame_margins(self) -> tuple[int, int, int, int]:
+        """Window decoration around the client area; estimated until the window is shown."""
+        if not self.isVisible():
+            return FRAME_ESTIMATE
+        frame = self.frameGeometry()
+        client = self.geometry()
+        return (
+            client.x() - frame.x(),
+            client.y() - frame.y(),
+            frame.right() - client.right(),
+            frame.bottom() - client.bottom(),
+        )
+
+    def _usable_area(self, point: QPoint | None = None) -> QRect:
+        """Client area of the screen under ``point`` (primary screen when None).
+
+        Qt's availableGeometry already excludes the Windows taskbar and is in
+        logical pixels, so display scaling is handled by Qt. The top is pushed
+        down by the title bar so the window can always be grabbed.
+        """
+        available = self._screen_available(point)
+        left, top, right, bottom = self._frame_margins()
+        return QRect(
+            available.x() + left,
+            available.y() + top,
+            max(1, available.width() - left - right),
+            max(1, available.height() - top - bottom),
+        )
+
+    def _fit_to_screen(self) -> None:
+        """Once shown, clamp the real window frame (title bar and borders) onto the screen."""
+        if self.isMaximized() or self.isFullScreen():
+            return
+        area = self._usable_area(self.frameGeometry().center())
+        target = clamp_window_rect(self.geometry(), area, self._root.minimumSizeHint())
+        if target != self.geometry():
+            self.setGeometry(target)
+
+    def _apply_startup_geometry(self) -> None:
+        """Fit the window to the usable screen: a saved geometry clamped to it, or a fresh fit."""
+        saved = self.state.window
+        geometry = saved.get("geometry")
+        if isinstance(geometry, list) and len(geometry) == 4:
+            saved_rect = QRect(*(int(value) for value in geometry))
+            minimum = self._root.minimumSizeHint()
+            target = clamp_window_rect(saved_rect, self._usable_area(saved_rect.center()), minimum)
+        else:
+            target = initial_window_rect(self._usable_area())
+        self.setGeometry(target)
+        if saved.get("maximized") is True:
+            self.showMaximized()
+
+    def _window_state(self) -> dict:
+        """Serializable geometry and splitter proportions for the next launch."""
+        rect = self.normalGeometry() if self.isMaximized() else self.geometry()
+        splitters = {
+            name: fractions_from_sizes(splitter.sizes())
+            for name, splitter in self._splitters.items()
+            if splitter.isVisible()
+        }
+        return {
+            "geometry": [rect.x(), rect.y(), rect.width(), rect.height()],
+            "maximized": self.isMaximized(),
+            "splitters": splitters,
+        }
+
+    @staticmethod
+    def _splitter_metrics(splitter: QSplitter) -> tuple[int, list[int]]:
+        horizontal = splitter.orientation() == Qt.Orientation.Horizontal
+        children = [splitter.widget(i) for i in range(splitter.count())]
+        minimums = [
+            (child.minimumSizeHint().width() if horizontal else child.minimumSizeHint().height())
+            for child in children
+            if child is not None
+        ]
+        span = splitter.width() if horizontal else splitter.height()
+        total = span - splitter.handleWidth() * max(0, splitter.count() - 1)
+        return total, minimums
+
+    def _set_splitter_fractions(self, splitter: QSplitter, fractions: list[float]) -> None:
+        total, minimums = self._splitter_metrics(splitter)
+        if len(fractions) != splitter.count() or total <= 0:
+            return
+        splitter.setSizes(sizes_from_fractions(fractions, total, minimums))
+
+    def _restore_splitters(self) -> None:
+        saved = self.state.window.get("splitters", {})
+        if not isinstance(saved, dict):
+            saved = {}
+        for name, splitter in self._splitters.items():
+            if splitter.isHidden() or splitter.count() == 0:
+                continue
+            fractions = saved.get(name)
+            if not isinstance(fractions, list) or len(fractions) != splitter.count():
+                count = splitter.count()
+                fractions = DEFAULT_SPLITTER_FRACTIONS.get(name, [1 / count] * count)
+                if name == "vertical" and not self.extra_row.isHidden():
+                    fractions = [0.4, 0.4, 0.2]
+            self._set_splitter_fractions(splitter, [float(value) for value in fractions])
+
+    def _show_extra_row(self) -> None:
+        newly_shown = self.extra_row.isHidden()
+        self.extra_row.show()
+        if newly_shown and self.vertical.isVisible():
+            self._set_splitter_fractions(self.vertical, [0.4, 0.4, 0.2])
+        self._schedule_save()
+
+    def _schedule_save(self) -> None:
+        self._save_timer.start()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().showEvent(event)
+        if not self._layout_applied:
+            self._layout_applied = True
+            # Run after the first layout pass so splitter widths are known.
+            QTimer.singleShot(0, self._finish_startup_layout)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        if self._layout_ready:
+            self._schedule_save()
+
+    def moveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().moveEvent(event)
+        if self._layout_ready:
+            self._schedule_save()
+
+    def _finish_startup_layout(self) -> None:
+        self._fit_to_screen()
+        self._restore_splitters()
+        self._layout_ready = True
+        self._schedule_save()
+
     def _persist(self) -> None:
+        if self._layout_ready:
+            self.state.window = self._window_state()
         self.state.panels = [
             PanelConfig(panel_id, str(panel.profile_box.currentData()), panel.cwd)
             for panel_id, panel in self.panels.items()

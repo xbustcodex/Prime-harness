@@ -31,6 +31,8 @@ class AppState:
     panels: list[PanelConfig] = field(default_factory=list)
     supervisor_history: list[str] = field(default_factory=list)
     default_cwd: str = ""
+    # Window geometry, maximized flag, and splitter proportions (see desktop_app).
+    window: dict = field(default_factory=dict)
 
 
 def default_state_path() -> Path:
@@ -55,6 +57,7 @@ def load_state(path: Path) -> AppState:
             panels=[PanelConfig(**p) for p in data.get("panels", [])],
             supervisor_history=[str(line) for line in data.get("supervisor_history", [])][-500:],
             default_cwd=str(data.get("default_cwd", "")),
+            window=dict(data.get("window", {})),
         )
     except (ValueError, KeyError, TypeError):
         backup = path.with_suffix(".corrupt.json")
@@ -74,6 +77,7 @@ def save_state(path: Path, state: AppState) -> None:
         "panels": [vars(p) for p in state.panels],
         "supervisor_history": state.supervisor_history[-500:],
         "default_cwd": state.default_cwd,
+        "window": state.window,
     }
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")

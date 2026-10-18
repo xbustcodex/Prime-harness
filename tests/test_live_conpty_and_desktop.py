@@ -54,6 +54,34 @@ def test_live_interactive_input_is_echoed_through_vt_engine():
 
 
 @pytest.mark.skipif(not WINDOWS, reason="ConPTY requires Windows")
+def test_live_window_resize_reaches_conpty_grid(monkeypatch, tmp_path):
+    """Real ConPTY: each window resize updates the child's reported console size."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from prime_harness import desktop_app
+    from prime_harness.persistence import AppState
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = desktop_app.MainWindow(state_path=tmp_path / "state.json", state=AppState())
+    window.show()
+    try:
+        panel = window.panels["1"]
+        panel.profile_box.setCurrentIndex(panel.profile_box.findData("cmd"))
+        assert window.start_panel("1"), panel.status.text()
+        for width, height in [(1000, 600), (1400, 800)]:
+            window.resize(width, height)
+            for _ in range(3):
+                app.processEvents()
+            panel.view.flush_grid()
+            time.sleep(0.2)
+            expected = (panel.view.vt.rows, panel.view.vt.cols)
+            assert panel.session is not None and panel.session.running
+            assert tuple(panel.session._process.getwinsize()) == expected
+    finally:
+        window.close()
+
+
+@pytest.mark.skipif(not WINDOWS, reason="ConPTY requires Windows")
 def test_live_stop_terminates_whole_process_tree():
     session = PtySession("live-stop", ["cmd.exe", "/d", "/q"], rows=24, cols=80)
     assert session.start(), session.error
