@@ -57,12 +57,16 @@ jobs:
           PRIME_HARNESS_API_PORT: "8421"
         run: |
           $process = Start-Process -FilePath dist/PrimeHarnessControlRoom.exe -PassThru
-          Start-Sleep -Seconds 14
-          $process.Refresh()
-          if ($process.HasExited) { throw "Application exited early with code $($process.ExitCode)" }
-          $index = curl.exe -s -o $null -w "%{http_code}" --max-time 5 http://127.0.0.1:8421/
+          $index = ""
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            $process.Refresh()
+            if ($process.HasExited) { throw "Application exited early with code $($process.ExitCode)" }
+            $index = curl.exe -s -o NUL -w "%{http_code}" --max-time 3 http://127.0.0.1:8421/
+            if ($LASTEXITCODE -eq 0 -and $index -eq "200") { break }
+          }
           if ($index -ne "200") { throw "Control API index returned '$index' instead of 200" }
-          $unauth = curl.exe -s -o $null -w "%{http_code}" --max-time 5 http://127.0.0.1:8421/api/sessions
+          $unauth = curl.exe -s -o NUL -w "%{http_code}" --max-time 3 http://127.0.0.1:8421/api/sessions
           if ($unauth -ne "401") { throw "Expected 401 without token, got '$unauth'" }
           Stop-Process -Id $process.Id -Force
           Get-Process PrimeHarnessControlRoom -ErrorAction SilentlyContinue | Stop-Process -Force
