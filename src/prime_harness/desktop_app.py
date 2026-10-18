@@ -843,7 +843,12 @@ class MainWindow(QMainWindow):
                 )
         elif action == "pair":
             panel_id = ident or target or ""
-            if panel_id not in self.panels:
+            if ident in {"all", "supervisor"}:
+                # Supervisor scope: sees every session; commands still name one target.
+                _token, url = self.room.pairings.pair(None, label="supervisor")
+                self.supervisor.log(f"Supervisor pairing link (token shown once):\n{url}")
+                self.room.publish("paired", None, "supervisor pairing link issued")
+            elif panel_id not in self.panels:
                 self.supervisor.log("Usage: /pair <id> (or select a target first)")
             else:
                 token, url = self.room.pairings.pair(panel_id, label=f"terminal-{panel_id}")

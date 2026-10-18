@@ -190,7 +190,7 @@ class Supervisor:
 CHAT_HELP = (
     "Commands: /to <id> (select target) · /send <text> · /approve <cmd#> · /reject <cmd#>\n"
     "/queue · /review [id] · /pause [id] · /resume [id] · /stop [id] · /restart [id] · /status\n"
-    "/pair [id] · /revoke <id|all> · /api start|stop|status\n"
+    "/pair [id|all] · /revoke <id|all> · /api start|stop|status\n"
     "Plain text goes to the selected target only. Pause stops delivery of queued commands;\n"
     "it does not suspend the agent process."
 )

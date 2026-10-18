@@ -10,11 +10,13 @@ sources at the end). Nothing here claims a live ChatGPT conversation sync.
 
 * `/pair [id]` in the supervisor chat issues one **revocable pairing link and
   token** for one terminal: `http://<public-base>/pair/<token>`.
+* `/pair all` issues a **supervisor-scoped** pairing instead: it may discover
+  every session, but each command still names one explicit terminal.
 * Only the SHA-256 hash of a token is stored; the token is shown once.
-* A token is bound to exactly one terminal and to an explicit permission set
-  (`status`, `output`, `command`, `approve`). A supervisor-scoped token
-  (`/pair` without a terminal) may discover all sessions but every command
-  still names one explicit terminal.
+* A token is bound to exactly one terminal (or, for `/pair all`, to supervisor
+  scope) and to an explicit permission set (`status`, `output`, `command`,
+  `approve`). A supervisor-scoped token may discover all sessions but every
+  command still names one explicit terminal.
 * `/revoke <id>` and `/revoke all` invalidate tokens immediately; revoked or
   unknown tokens get HTTP 401 on every endpoint.
 * Opening the pairing link in a browser (phone or laptop) serves a small chat

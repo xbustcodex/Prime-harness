@@ -265,6 +265,47 @@ def test_live_api_server_serves_over_tcp(room):
         assert server.stop(timeout=10)
 
 
+def _token_from_history(history, needle: str) -> str:
+    line = next(line for line in reversed(history) if needle in line)
+    return line.rsplit("/pair/", 1)[1].split()[0]
+
+
+def test_chat_pairing_issues_terminal_and_supervisor_tokens(tmp_path, monkeypatch):
+    """The supervisor chat can issue both a terminal pairing and a supervisor pairing."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from prime_harness.desktop_app import MainWindow
+
+    window = MainWindow(state_path=tmp_path / "state.json")
+    try:
+        window.handle_chat("/pair 2")
+        terminal_token = _token_from_history(window.supervisor.history, "[2] pairing link")
+        record = window.room.pairings.authenticate(terminal_token)
+        assert record is not None and record.terminal_id == "2"
+
+        window.handle_chat("/pair all")
+        supervisor_token = _token_from_history(window.supervisor.history,
+                                               "Supervisor pairing link")
+        supervisor_record = window.room.pairings.authenticate(supervisor_token)
+        assert supervisor_record is not None and supervisor_record.terminal_id is None
+
+        from fastapi.testclient import TestClient
+
+        from prime_harness.mcp_api import create_control_api
+
+        client = TestClient(create_control_api(window.room))
+        seen = client.get("/api/sessions", headers=_auth(supervisor_token))
+        assert seen.status_code == 200
+        assert len(seen.json()["sessions"]) == 4  # all terminals, contexts separate
+
+        window.handle_chat("/revoke all")
+        assert window.room.pairings.authenticate(supervisor_token) is None
+        assert client.get("/api/sessions", headers=_auth(supervisor_token)).status_code == 401
+    finally:
+        window.close()
+
+
 # ------------------------------------------------------------- clipboard
 class _FakeSession:
     running = True
