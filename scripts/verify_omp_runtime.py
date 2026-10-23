@@ -39,6 +39,20 @@ _STAGES = {
 }
 
 
+def _failure_summary(result: object) -> str:
+    """Describe categorical failure evidence without printing agent output."""
+    evidence = getattr(result, "evidence", None)
+    diagnostics = evidence.get("diagnostics", {}) if isinstance(evidence, dict) else {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    fields = ("outcome_status", "agent_invoked", "session_settled", "tools_invoked", "tool_failures", "approval_blocked")
+    safe = {key: diagnostics[key] for key in fields if key in diagnostics}
+    status = getattr(result, "status", "unknown")
+    if status not in {"completed", "failed", "aborted", "approval_required"}:
+        status = "unknown"
+    return f"status={status} diagnostics={safe}"
+
+
 def verify(executable: str) -> None:
     """Run verification with detailed stage tracking and error reporting.
     
@@ -98,7 +112,7 @@ def verify(executable: str) -> None:
                     ),
                 )
                 if not first.success:
-                    raise OmpRpcError("Initial OMP instruction did not complete")
+                    raise OmpRpcError("Initial OMP instruction did not complete; " + _failure_summary(first))
 
                 current_stage = "first_file_verify"
                 first_file = lane.workspace_path / "omp-runtime-check.txt"
@@ -135,7 +149,7 @@ def verify(executable: str) -> None:
                     ),
                 )
                 if not correction.success:
-                    raise OmpRpcError("OMP correction did not complete")
+                    raise OmpRpcError("OMP correction did not complete; " + _failure_summary(correction))
 
                 current_stage = "correction_file_verify"
                 correction_file = lane.workspace_path / "omp-correction-check.txt"
@@ -179,7 +193,7 @@ def verify(executable: str) -> None:
                     "Confirm the correction is present and continue without further edits.",
                 )
                 if not continuation.success:
-                    raise OmpRpcError("Restored OMP session could not continue")
+                    raise OmpRpcError("Restored OMP session could not continue; " + _failure_summary(continuation))
 
                 current_stage = "restored_process_stop"
                 if not restored_provider.stop_session(restored):
@@ -200,7 +214,7 @@ def verify(executable: str) -> None:
             if stage_obj
             else str(current_stage or "unknown")
         )
-        error_msg = str(exc) if str(exc) else type(exc).__name__
+        error_msg = str(exc) if isinstance(exc, OmpRpcError) else type(exc).__name__
         print(
             f"REAL_OMP_VERIFICATION=FAIL stage={stage_info} error={error_msg}",
             file=sys.stderr,

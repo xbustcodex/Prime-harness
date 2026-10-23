@@ -305,3 +305,51 @@ def test_omp_workflow_reviewer_correction_and_sqlite_restore(
     assert restarted_session.process_status == "restored"
     assert len(fake_omp) == 2
     restarted_provider._processes[session.session_id].close()
+
+
+def test_omp_agent_not_invoked_is_failure(tmp_path: Path, fake_omp: list[_FakeOmpProcess], monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = OmpAgentProvider("agent-1", tmp_path, executable="omp")
+    session = provider.start_session()
+    process = provider._processes[session.session_id]
+    monkeypatch.setattr(process, "prompt_and_wait", lambda _instruction: (
+        {"status": "completed", "agentInvoked": False, "sessionSettled": True}, []
+    ))
+    result = provider.send_instruction(session, "Create a file")
+    assert result.success is False
+    assert result.evidence["diagnostics"]["agent_invoked"] is False
+
+
+@pytest.mark.parametrize("status", ["aborted", "error"])
+def test_omp_terminal_failure_status(tmp_path: Path, fake_omp: list[_FakeOmpProcess], monkeypatch: pytest.MonkeyPatch, status: str) -> None:
+    provider = OmpAgentProvider("agent-1", tmp_path, executable="omp")
+    session = provider.start_session()
+    monkeypatch.setattr(provider._processes[session.session_id], "prompt_and_wait", lambda _instruction: (
+        {"status": status, "agentInvoked": True}, []
+    ))
+    result = provider.send_instruction(session, "Create a file")
+    assert result.success is False
+    assert result.evidence["diagnostics"]["outcome_status"] == status
+
+
+def test_omp_tool_failure_is_not_success(tmp_path: Path, fake_omp: list[_FakeOmpProcess], monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = OmpAgentProvider("agent-1", tmp_path, executable="omp")
+    session = provider.start_session()
+    events = [
+        {"type": "tool_execution_start", "toolName": "write"},
+        {"type": "tool_execution_end", "toolName": "write", "isError": True, "result": {"isError": True}},
+    ]
+    monkeypatch.setattr(provider._processes[session.session_id], "prompt_and_wait", lambda _instruction: (
+        {"status": "completed", "agentInvoked": True}, events
+    ))
+    result = provider.send_instruction(session, "Create a file")
+    assert result.success is False
+    assert result.evidence["diagnostics"]["tool_failures"] == ["write"]
+
+
+def test_omp_diagnostics_do_not_expose_arbitrary_tool_names() -> None:
+    diagnostics = OmpAgentProvider._build_instruction_diagnostics(
+        {"status": "error"},
+        [{"type": "tool_execution_start", "toolName": "secret-api-key-123"}],
+    )
+    assert diagnostics["tools_invoked"] == ["other"]
+    assert "secret-api-key-123" not in repr(diagnostics)

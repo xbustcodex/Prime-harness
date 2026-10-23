@@ -559,6 +559,17 @@ class OmpAgentProvider:
                 evidence=self._evidence(events, session, status, diagnostics),
             )
 
+        if outcome.get("agentInvoked") is False:
+            session.process_status = "failed"
+            return AgentCommandResult(
+                False,
+                assistant_text,
+                "OMP agent was not invoked",
+                "failed",
+                changed_files=changed_files,
+                evidence=self._evidence(events, session, status, diagnostics),
+            )
+
         if status == "aborted":
             session.process_status = "stopped"
             return AgentCommandResult(
@@ -570,7 +581,7 @@ class OmpAgentProvider:
                 evidence=self._evidence(events, session, status, diagnostics),
             )
 
-        if status != "completed":
+        if status != "completed" or diagnostics.get("tool_failures"):
             session.process_status = "failed"
             error_msg = self._format_failure_message(diagnostics)
             return AgentCommandResult(
@@ -734,8 +745,7 @@ class OmpAgentProvider:
 
         # Outcome status and invocation state
         status = outcome.get("status")
-        if isinstance(status, str):
-            diagnostics["outcome_status"] = status
+        diagnostics["outcome_status"] = status if status in _TERMINAL_PROMPT_STATUSES else "unknown"
 
         agent_invoked = outcome.get("agentInvoked")
         if isinstance(agent_invoked, bool):
@@ -755,30 +765,24 @@ class OmpAgentProvider:
             if event_type == "tool_execution_start":
                 tool_name = event.get("toolName")
                 if isinstance(tool_name, str):
-                    tools_invoked.add(tool_name[:50])
+                    tools_invoked.add(tool_name[:50] if tool_name in {"write", "edit", "ast_edit", "read", "bash", "shell"} else "other")
             
             elif event_type == "tool_execution_end":
                 tool_name = event.get("toolName")
                 if isinstance(tool_name, str):
-                    if event.get("isError") is True:
-                        # Only record if we see evidence of failure
-                        tool_failures[tool_name[:50]] = "error"
+                    result = event.get("result")
+                    if event.get("isError") is True or (isinstance(result, dict) and result.get("isError") is True):
+                        tool_failures[tool_name if tool_name in {"write", "edit", "ast_edit", "read", "bash", "shell"} else "other"] = "error"
 
-        if tools_invoked:
-            diagnostics["tools_invoked"] = sorted(tools_invoked)
+        diagnostics["tools_invoked"] = sorted(tools_invoked)[:12]
         
-        if tool_failures:
-            diagnostics["tool_failures"] = sorted(tool_failures.keys())
+        diagnostics["tool_failures"] = sorted(tool_failures.keys())[:12]
 
         # Agent lifecycle events
         agent_started = any(e.get("type") == "agent_start" for e in events)
         agent_ended = any(e.get("type") == "agent_end" for e in events)
         
-        if agent_started or agent_ended:
-            diagnostics["agent_lifecycle"] = {
-                "started": agent_started,
-                "ended": agent_ended,
-            }
+        diagnostics["agent_lifecycle"] = {"started": agent_started, "ended": agent_ended}
 
         return diagnostics
 
@@ -789,16 +793,15 @@ class OmpAgentProvider:
         agent_invoked = diagnostics.get("agent_invoked")
         tool_failures = diagnostics.get("tool_failures")
 
+        if agent_invoked is False:
+            return "OMP agent was not invoked"
+        if tool_failures:
+            return "OMP tool execution failed (" + ", ".join(tool_failures[:2]) + ")"
+        if status == "error":
+            return "OMP prompt returned error status"
         if status == "aborted":
-            return "OMP operation was aborted"
-        elif status == "error":
-            return "OMP operation encountered an error"
-        elif agent_invoked is False:
-            return "OMP agent was not invoked; operation could not proceed"
-        elif tool_failures:
-            return f"OMP operation failed: tools failed ({', '.join(tool_failures[:2])})"
-        else:
-            return "OMP operation did not complete"
+            return "OMP prompt was aborted"
+        return "OMP operation did not complete"
 
     def _evidence(
         self,
